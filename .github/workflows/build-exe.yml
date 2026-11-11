@@ -2,12 +2,12 @@ name: Build Windows EXE
 
 on:
   push:
-    branches: [ "main", "master" ] # Запускать при пуше в главную ветку
-  workflow_dispatch: # Позволяет запускать сборку вручную кнопкой
+    branches: [ "main", "master" ]
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: windows-latest # GitHub выдаёт виртуальную машину с Windows
+    runs-on: windows-latest
 
     steps:
     - name: Checkout code
@@ -16,16 +16,14 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10' # Можно указать вашу версию, например '3.12'
+        python-version: '3.10'
 
-    - name: Install PyInstaller
+    - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pyinstaller
+        pip install -r requirements.txt
 
     - name: Build with PyInstaller
-      # Собираем client.py в один exe-файл с именем ClientApp
-      # Если нужны сторонние библиотеки, их надо установить в шаге выше
       run: pyinstaller --onefile --name ClientApp client.py
 
     - name: Upload EXE artifact
