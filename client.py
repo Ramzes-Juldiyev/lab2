@@ -18,6 +18,7 @@ import time
 from collections import deque, Counter
 from datetime import datetime
 
+
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
@@ -28,7 +29,13 @@ from PySide6.QtWidgets import (
     QDialogButtonBox, QDoubleSpinBox
 )
 
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+import math
+import numpy as np
+
+from matplotlib.backends.backend_qtagg import (
+    FigureCanvasQTAgg,
+    NavigationToolbar2QT,
+)
 from matplotlib.figure import Figure
 
 
@@ -464,37 +471,399 @@ def validate_name(name: str):
     return None
 
 
+
 class GraphCanvas(FigureCanvasQTAgg):
-    """График с неизменным диапазоном X при любом размере области."""
+    """Интерактивный график с масштабированием, перемещением и выбором точек."""
+
     def __init__(self, parent=None):
-        self.figure = Figure(figsize=(6, 2.7), tight_layout=True)
+        self.figure = Figure(figsize=(6, 3.2), dpi=100, facecolor="#FFFFFF")
         super().__init__(self.figure)
         self.setParent(parent)
+
         self.ax = self.figure.add_subplot(111)
+
+        self.function_name = "sin"
         self.xmin, self.xmax = 0.0, 10.0
         self.ymin, self.ymax = -1.5, 1.5
-        self.ax.set_xlim(self.xmin, self.xmax)
-        self.ax.set_ylim(self.ymin, self.ymax)
-        self.ax.set_xlabel("x")
-        self.ax.set_ylabel("y")
-        self.ax.set_title("График функции y = sin(x)")
-        self.ax.grid(True, alpha=0.3)
-        self.ax.axhline(0, color="#555555", linewidth=0.8)
-        self.ax.axvline(0, color="#555555", linewidth=0.8)
-        self.x_values = [self.xmin + i * (self.xmax-self.xmin) / 1000 for i in range(1001)]
-        self.y_values = [__import__("math").sin(x) for x in self.x_values]
-        self.ax.plot(self.x_values, self.y_values, linewidth=2, color="#2878B5")
-        self.ax.set_xticks([0, 2, 4, 6, 8, 10])
-        self.ax.set_yticks([-1, -0.5, 0, 0.5, 1])
-        self.draw()
 
-    def resizeEvent(self, event):
-        # Matplotlib пересчитывает геометрию холста; пределы осей намеренно неизменны.
-        super().resizeEvent(event)
+        self._drag_start = None
+        self._dragged = False
+        self._selected_index = None
+
+        self.point_info_callback = None
+
+        # Оформление графика
+        self.ax.set_facecolor("#FBFCFE")
+        self.ax.set_xlabel("x", fontsize=9)
+        self.ax.set_ylabel("y", fontsize=9)
+        self.ax.set_title(
+            "y = sin(x)",
+            fontsize=11,
+            fontweight="bold",
+            pad=10
+        )
+
+        self.ax.grid(
+            True,
+            color="#DCE3EA",
+            linewidth=0.8,
+            alpha=0.9
+        )
+
+        self.ax.axhline(0, color="#687586", linewidth=0.9, zorder=1)
+        self.ax.axvline(0, color="#687586", linewidth=0.9, zorder=1)
+
+        self.ax.tick_params(labelsize=8, colors="#465365")
+
+        for spine in self.ax.spines.values():
+            spine.set_color("#C9D2DC")
+
+        # Основная линия функции
+        self.curve, = self.ax.plot(
+            [],
+            [],
+            color="#2878B5",
+            linewidth=2.2,
+            solid_capstyle="round",
+            zorder=3
+        )
+
+        # Маркер выбранной точки
+        self.selected_marker, = self.ax.plot(
+            [],
+            [],
+            marker="o",
+            markersize=8,
+            markerfacecolor="#F59E0B",
+            markeredgecolor="#FFFFFF",
+            markeredgewidth=1.5,
+            linestyle="None",
+            zorder=6
+        )
+
+        # Всплывающая подпись координат
+        self.annotation = self.ax.annotate(
+            "",
+            xy=(0, 0),
+            xytext=(12, 14),
+            textcoords="offset points",
+            bbox=dict(
+                boxstyle="round,pad=0.4",
+                fc="#172334",
+                ec="none",
+                alpha=0.94
+            ),
+            color="white",
+            fontsize=8,
+            arrowprops=dict(
+                arrowstyle="->",
+                color="#172334",
+                lw=0.8
+            ),
+            zorder=10
+        )
+
+        self.annotation.set_visible(False)
+
         self.ax.set_xlim(self.xmin, self.xmax)
         self.ax.set_ylim(self.ymin, self.ymax)
+
+        self._redraw_function()
+        self.figure.tight_layout(pad=2.0)
+
+        # Обработчики событий мыши
+        self.mpl_connect("scroll_event", self._on_scroll)
+        self.mpl_connect("button_press_event", self._on_press)
+        self.mpl_connect("motion_notify_event", self._on_motion)
+        self.mpl_connect("button_release_event", self._on_release)
+        self.mpl_connect("axes_leave_event", self._on_axes_leave)
+
+    def _function(self, x):
+        if self.function_name == "sin":
+            return np.sin(x)
+
+        return np.cos(x)
+
+    def _redraw_function(self):
+        """Перестраивает кривую для текущего диапазона оси X."""
+
+        x0, x1 = self.ax.get_xlim()
+
+        count = int(min(6000, max(1200, abs(x1 - x0) * 180)))
+
+        self.x_values = np.linspace(x0, x1, count)
+        self.y_values = self._function(self.x_values)
+
+        self.curve.set_data(self.x_values, self.y_values)
+
+        title = (
+            "y = sin(x)"
+            if self.function_name == "sin"
+            else "y = cos(x)"
+        )
+
+        self.ax.set_title(
+            title,
+            fontsize=11,
+            fontweight="bold",
+            pad=10
+        )
+
         self.draw_idle()
 
+    def set_function(self, name):
+        """Переключает отображаемую функцию."""
+
+        if name not in ("sin", "cos"):
+            return
+
+        self.function_name = name
+
+        self._selected_index = None
+        self.selected_marker.set_data([], [])
+        self.annotation.set_visible(False)
+
+        self._redraw_function()
+
+        self._notify_info(
+            "Наведите курсор на кривую или нажмите на неё, "
+            "чтобы узнать координаты."
+        )
+
+    def reset_view(self):
+        """Возвращает исходный масштаб."""
+
+        self.ax.set_xlim(0.0, 10.0)
+        self.ax.set_ylim(-1.5, 1.5)
+
+        self._selected_index = None
+        self.selected_marker.set_data([], [])
+        self.annotation.set_visible(False)
+
+        self._redraw_function()
+
+        self._notify_info("Исходный масштаб: X от 0 до 10.")
+
+    def set_x_range(self, xmin, xmax):
+        """Устанавливает пользовательский диапазон X."""
+
+        if not (
+            math.isfinite(xmin)
+            and math.isfinite(xmax)
+            and xmin < xmax
+        ):
+            return False
+
+        if xmax - xmin < 1e-6:
+            return False
+
+        self.ax.set_xlim(xmin, xmax)
+        self._redraw_function()
+
+        return True
+
+    def _notify_info(self, text):
+        if callable(self.point_info_callback):
+            self.point_info_callback(text)
+
+    def _nearest_point(self, event):
+        """Находит ближайшую точку кривой в экранных координатах."""
+
+        if event.inaxes != self.ax or event.xdata is None:
+            return None
+
+        points = np.column_stack(
+            (self.x_values, self.y_values)
+        )
+
+        pixels = self.ax.transData.transform(points)
+        cursor = np.array([event.x, event.y])
+
+        distances = np.sqrt(
+            np.sum((pixels - cursor) ** 2, axis=1)
+        )
+
+        index = int(np.argmin(distances))
+
+        # Допустимое расстояние до кривой — 18 пикселей
+        if distances[index] > 18:
+            return None
+
+        return index
+
+    def _show_point(self, index, selected=False):
+        """Показывает координаты найденной точки."""
+
+        x = float(self.x_values[index])
+        y = float(self.y_values[index])
+
+        self.annotation.xy = (x, y)
+        self.annotation.set_text(
+            f"x = {x:.6f}\ny = {y:.6f}"
+        )
+
+        self.annotation.set_visible(True)
+
+        if selected:
+            self._selected_index = index
+
+            self.selected_marker.set_data(
+                [x],
+                [y]
+            )
+
+            self._notify_info(
+                f"Выбранная точка: "
+                f"x = {x:.6f}   |   y = {y:.6f}"
+            )
+        else:
+            self._notify_info(
+                f"Координаты курсора: "
+                f"x = {x:.5f}   |   y = {y:.5f}"
+            )
+
+        self.draw_idle()
+
+    def _on_scroll(self, event):
+        """Масштабирование относительно положения курсора."""
+
+        if (
+            event.inaxes != self.ax
+            or event.xdata is None
+            or event.ydata is None
+        ):
+            return
+
+        scale = 0.82 if event.button == "up" else 1.22
+
+        x_left, x_right = self.ax.get_xlim()
+        y_bottom, y_top = self.ax.get_ylim()
+
+        new_width = (x_right - x_left) * scale
+        new_height = (y_top - y_bottom) * scale
+
+        rel_x = (
+            (event.xdata - x_left)
+            / (x_right - x_left)
+        )
+
+        rel_y = (
+            (event.ydata - y_bottom)
+            / (y_top - y_bottom)
+        )
+
+        self.ax.set_xlim(
+            event.xdata - new_width * rel_x,
+            event.xdata + new_width * (1 - rel_x)
+        )
+
+        self.ax.set_ylim(
+            event.ydata - new_height * rel_y,
+            event.ydata + new_height * (1 - rel_y)
+        )
+
+        self._redraw_function()
+
+    def _on_press(self, event):
+        if event.inaxes != self.ax:
+            return
+
+        # Не вмешиваемся в штатные режимы Matplotlib
+        toolbar = getattr(self, "toolbar", None)
+
+        if toolbar is not None and toolbar.mode:
+            return
+
+        if (
+            event.button == 1
+            and event.xdata is not None
+            and event.ydata is not None
+        ):
+            self._drag_start = (
+                event.x,
+                event.y,
+                event.xdata,
+                event.ydata
+            )
+
+            self._dragged = False
+
+    def _on_motion(self, event):
+        if event.inaxes != self.ax:
+            if self._drag_start is None:
+                self.annotation.set_visible(False)
+                self.draw_idle()
+
+            return
+
+        # Перемещение графика перетаскиванием
+        if (
+            self._drag_start is not None
+            and event.xdata is not None
+            and event.ydata is not None
+        ):
+            sx, sy, start_x, start_y = self._drag_start
+
+            dx_pixels = event.x - sx
+            dy_pixels = event.y - sy
+
+            if abs(dx_pixels) + abs(dy_pixels) > 4:
+                self._dragged = True
+
+                x0, x1 = self.ax.get_xlim()
+                y0, y1 = self.ax.get_ylim()
+
+                dx = event.xdata - start_x
+                dy = event.ydata - start_y
+
+                self.ax.set_xlim(x0 - dx, x1 - dx)
+                self.ax.set_ylim(y0 - dy, y1 - dy)
+
+                self._redraw_function()
+                return
+
+        # Отображение координат при наведении
+        index = self._nearest_point(event)
+
+        if index is not None:
+            self._show_point(index)
+
+        elif self._selected_index is None:
+            self.annotation.set_visible(False)
+
+            self._notify_info(
+                f"x = {event.xdata:.5f}   |   "
+                f"y = {event.ydata:.5f}"
+                if event.xdata is not None
+                and event.ydata is not None
+                else "Наведите курсор на кривую."
+            )
+
+            self.draw_idle()
+
+    def _on_release(self, event):
+        if self._drag_start is None:
+            return
+
+        was_dragged = self._dragged
+
+        self._drag_start = None
+        self._dragged = False
+
+        # Если мышь не перемещалась, считаем действие выбором точки
+        if not was_dragged and event.inaxes == self.ax:
+            index = self._nearest_point(event)
+
+            if index is not None:
+                self._show_point(index, selected=True)
+
+    def _on_axes_leave(self, event):
+        if (
+            self._drag_start is None
+            and self._selected_index is None
+        ):
+            self.annotation.set_visible(False)
+            self.draw_idle()
 
 class ChatClientWindow(QMainWindow):
     def __init__(self):
@@ -634,14 +1003,90 @@ class ChatClientWindow(QMainWindow):
         stats_layout.addWidget(self.stats_answer)
         right_layout.addWidget(stats_box)
 
-        graph_box = QGroupBox("График функции")
+        graph_box = QGroupBox("Интерактивный график")
         graph_layout = QVBoxLayout(graph_box)
+        graph_layout.setContentsMargins(8, 10, 8, 8)
+        graph_layout.setSpacing(6)
+
+        # Панель настроек графика
+        graph_controls = QHBoxLayout()
+
+        graph_controls.addWidget(QLabel("Функция:"))
+
+        self.graph_function_combo = QComboBox()
+        self.graph_function_combo.addItem("Синус: sin(x)", "sin")
+        self.graph_function_combo.addItem("Косинус: cos(x)", "cos")
+
+        graph_controls.addWidget(self.graph_function_combo, 1)
+
+        graph_controls.addWidget(QLabel("X от:"))
+
+        self.graph_xmin = QDoubleSpinBox()
+        self.graph_xmin.setRange(-100000.0, 100000.0)
+        self.graph_xmin.setDecimals(2)
+        self.graph_xmin.setValue(0.0)
+        self.graph_xmin.setMaximumWidth(82)
+
+        graph_controls.addWidget(self.graph_xmin)
+
+        graph_controls.addWidget(QLabel("до:"))
+
+        self.graph_xmax = QDoubleSpinBox()
+        self.graph_xmax.setRange(-100000.0, 100000.0)
+        self.graph_xmax.setDecimals(2)
+        self.graph_xmax.setValue(10.0)
+        self.graph_xmax.setMaximumWidth(82)
+
+        graph_controls.addWidget(self.graph_xmax)
+
+        self.graph_apply_range = QPushButton("Применить")
+        self.graph_reset_button = QPushButton("Сбросить")
+
+        graph_controls.addWidget(self.graph_apply_range)
+        graph_controls.addWidget(self.graph_reset_button)
+
+        graph_layout.addLayout(graph_controls)
+
+        # Сам график
         self.graph = GraphCanvas()
-        graph_layout.addWidget(self.graph)
-        range_label = QLabel("Диапазон X: [0; 10] — фиксирован при изменении размера окна")
-        range_label.setStyleSheet("color: #657080;")
-        graph_layout.addWidget(range_label)
+
+        # Стандартная панель Matplotlib
+        self.graph_toolbar = NavigationToolbar2QT(
+            self.graph,
+            graph_box
+        )
+
+        self.graph.toolbar = self.graph_toolbar
+
+        graph_layout.addWidget(self.graph_toolbar)
+        graph_layout.addWidget(self.graph, 1)
+
+        # Информационная строка
+        self.graph_info = QLabel(
+            "Колесо мыши — масштаб • "
+            "перетаскивание — перемещение • "
+            "щелчок — выбрать точку"
+        )
+
+        self.graph_info.setWordWrap(True)
+        self.graph_info.setMinimumHeight(30)
+
+        self.graph_info.setStyleSheet(
+            "QLabel { "
+            "color: #465365; "
+            "background: #F3F6FA; "
+            "border: 1px solid #E0E6ED; "
+            "border-radius: 5px; "
+            "padding: 5px; "
+            "}"
+        )
+
+        self.graph.point_info_callback = self.graph_info.setText
+
+        graph_layout.addWidget(self.graph_info)
+
         right_layout.addWidget(graph_box, 1)
+
         splitter.addWidget(right)
         splitter.setSizes([260, 620, 500])
 
@@ -660,6 +1105,27 @@ class ChatClientWindow(QMainWindow):
         self.arduino_disconnect_button.clicked.connect(self.disconnect_arduino)
         self.mode_button.clicked.connect(self.toggle_mode)
         self.enc_button.clicked.connect(self.toggle_encoding)
+        self.graph_function_combo.currentIndexChanged.connect(
+            lambda _index: self.graph.set_function(
+                self.graph_function_combo.currentData()
+            )
+        )
+
+        self.graph_reset_button.clicked.connect(
+            self._reset_graph_view
+        )
+
+        self.graph_apply_range.clicked.connect(
+            self._apply_graph_range
+        )
+
+        self.graph_xmin.editingFinished.connect(
+            self._apply_graph_range
+        )
+
+        self.graph_xmax.editingFinished.connect(
+            self._apply_graph_range
+        )
         self.refresh_serial_ports()
 
         self._update_stats_view()
@@ -677,6 +1143,25 @@ class ChatClientWindow(QMainWindow):
         self.chat_view.setTextCursor(cursor)
         self.chat_view.ensureCursorVisible()
 
+    def _reset_graph_view(self):
+        self.graph.reset_view()
+
+        self.graph_xmin.setValue(0.0)
+        self.graph_xmax.setValue(10.0)
+
+    def _apply_graph_range(self):
+        xmin = self.graph_xmin.value()
+        xmax = self.graph_xmax.value()
+
+        if xmin >= xmax:
+            QMessageBox.warning(
+                self,
+                "Некорректный диапазон",
+                "Значение «X от» должно быть меньше значения «до»."
+            )
+            return
+
+        self.graph.set_x_range(xmin, xmax)
     def _color_for(self, name):
         if name not in self.user_colors:
             self.user_colors[name] = PALETTE[self.color_index % len(PALETTE)]
@@ -705,13 +1190,16 @@ class ChatClientWindow(QMainWindow):
     def _send_chat_line_to_arduino(self, sender, body, private, outgoing, recipient):
         if not self.arduino.is_connected:
             return
+
         if outgoing and private:
-            raw = f"@{self.my_name}>{recipient}: {body}"
+            raw = f"[PM] -> @ {recipient}: {body}"
         elif private:
-            raw = f"@{sender}: {body}"
+            raw = f"[PM] @ {sender}: {body}"
         else:
             raw = f"{sender}: {body}"
+
         self.arduino.send_chat_line(raw)
+
 
     def _update_users(self):
         ordered = []
@@ -1222,7 +1710,7 @@ class ChatClientWindow(QMainWindow):
     def disconnect_from_server(self):
         if self.connected:
             try:
-                self._send_raw("exit")
+                self._send_raw("#exit")
             except Exception:
                 pass
             self._set_disconnected_state()
