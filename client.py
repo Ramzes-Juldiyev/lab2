@@ -1106,7 +1106,7 @@ class ChatClientWindow(QMainWindow):
         if line.lower() == "#enc":
             self.toggle_encoding()
             return
-        if line.lower() == "exit":
+        if line.lower() == "#exit":
             self.disconnect_from_server()
             return
 
