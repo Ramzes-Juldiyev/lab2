@@ -1,1732 +1,1501 @@
-"""
-Лабораторная работа №3 — оконный клиент чата.
-Запуск: python client.py
-"""
-import sys
-import socket
-import threading
+#!/usr/bin/env python3
+# ЛР4. Клиент удалённого расчёта.
+# Расчёты выполняются на сервере, клиент отвечает за управление и визуализацию.
+
+import json
+import math
 import queue
-import time
-import re
-import errno
-import hashlib
-import os
+import socket
 import sys
-import tempfile
 import threading
-import time
-from collections import deque, Counter
-from datetime import datetime
+import uuid
 
-
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QTextCharFormat, QTextCursor
+from PySide6.QtCore import Qt, QTimer, QEvent
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QSplitter, QListWidget, QListWidgetItem, QTextEdit, QLineEdit,
-    QPushButton, QLabel, QGroupBox, QFormLayout, QSpinBox, QMenu,
-    QMessageBox, QInputDialog, QComboBox, QStatusBar, QDialog,
-    QDialogButtonBox, QDoubleSpinBox
+    QGridLayout, QGroupBox, QFormLayout, QLabel, QLineEdit,
+    QPushButton, QComboBox, QDoubleSpinBox, QSpinBox, QSlider,
+    QTextEdit, QMessageBox, QSplitter
 )
 
-import math
-import numpy as np
-
-from matplotlib.backends.backend_qtagg import (
-    FigureCanvasQTAgg,
-    NavigationToolbar2QT,
-)
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
 
-
-DEFAULT_HOST = "0.0.0.0"
-DEFAULT_PORT = 5123
-PING_INTERVAL_MS = 5000
-USERS_REFRESH_MS = 5000
-MAX_MESSAGE_LENGTH = 999
-
-PALETTE = [
-    "#2878B5", "#D65A31", "#27966F", "#9B59B6",
-    "#C18A16", "#D14D72", "#168C9A", "#6B7A32",
-    "#7A5AF8", "#A34A28"
-]
-GENERAL_TEXT_COLOR = "#20242A"
-SYSTEM_COLOR = "#7A8491"
-
-
-# ==================== Встроенная модель статистики ====================
-from collections import Counter
-from datetime import datetime
-
-
-class ChatStatistics:
-    def __init__(self):
-        self.start_time = None
-        self.general_total = 0
-        self.private_in = 0
-        self.private_out = 0
-        self.general_by_user = Counter()
-        self.total_by_user = Counter()
-
-    def start_session(self):
-        self.start_time = datetime.now()
-
-    def record_general(self, user, outgoing=False, count_message=True):
-        if count_message:
-            self.general_total += 1
-            self.general_by_user[user] += 1
-            self.total_by_user[user] += 1
-        elif outgoing:
-            # Эхо собственного сообщения не увеличивает счётчик повторно.
-            pass
-
-    def record_private(self, user, incoming=True):
-        if incoming:
-            self.private_in += 1
-        else:
-            self.private_out += 1
-        self.total_by_user[user] += 1
-
-    def set_users(self, users):
-        self.current_users = list(users)
-
-    def summary(self, online_count):
-        total = self.general_total + self.private_in + self.private_out
-        if self.general_by_user:
-            active, amount = self.general_by_user.most_common(1)[0]
-            active_text = f"{active} ({amount})"
-        else:
-            active_text = "пока нет"
-        if self.start_time:
-            duration = datetime.now() - self.start_time
-            duration_text = str(duration).split(".")[0]
-        else:
-            duration_text = "—"
-        return (
-            f"Участников онлайн: {online_count}\n"
-            f"Общих сообщений за сеанс: {self.general_total}\n"
-            f"Личных входящих: {self.private_in}\n"
-            f"Личных исходящих: {self.private_out}\n"
-            f"Всего личных: {self.private_in + self.private_out}\n"
-            f"Всего сообщений за сеанс: {total}\n"
-            f"Самый активный участник: {active_text}\n"
-            f"Длительность сеанса: {duration_text}"
-        )
-
-    def query(self, query, online_users):
-        q = query.strip()
-        low = q.lower()
-        if low in {"help", "помощь", "?"}:
-            return ("Запросы статистики:\n"
-                    "• введите имя — число сообщений участника за сеанс;\n"
-                    "• total — общее число сообщений;\n"
-                    "• private — число личных сообщений;\n"
-                    "• active — самый активный участник;\n"
-                    "• online — число участников онлайн.")
-        if low == "total":
-            return f"Всего сообщений за сеанс: {self.general_total + self.private_in + self.private_out}"
-        if low == "private":
-            return f"Личных сообщений за сеанс: {self.private_in + self.private_out}"
-        if low == "online":
-            return f"Сейчас онлайн: {len(online_users)}"
-        if low == "active":
-            if not self.general_by_user:
-                return "Пока нет общих сообщений."
-            name, count = self.general_by_user.most_common(1)[0]
-            return f"Самый активный участник: {name} ({count} общих сообщений)."
-        if q in self.total_by_user:
-            return f"{q}: {self.total_by_user[q]} сообщений за сеанс."
-        if q in self.general_by_user:
-            return f"{q}: {self.general_by_user[q]} общих сообщений за сеанс."
-        return f"Участник «{q}» пока не отправлял сообщений или не найден."
-
-
-# ==================== Встроенный менеджер Arduino ====================
-import errno
-import hashlib
-import os
-import re
-import sys
-import tempfile
-import threading
-import time
-
-
-def clean_text(value):
-    if value is None:
-        return ""
-    for ch in ("\ufeff", "\u200b", "\u200c", "\u200d", "\u2060", "\r"):
-        value = value.replace(ch, "")
-    return value.strip()
-
-
-TRANSLIT = {
-    "а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"e","ж":"zh",
-    "з":"z","и":"i","й":"i","к":"k","л":"l","м":"m","н":"n","о":"o",
-    "п":"p","р":"r","с":"s","т":"t","у":"u","ф":"f","х":"kh","ц":"ts",
-    "ч":"ch","ш":"sh","щ":"shch","ъ":"","ы":"y","ь":"","э":"e","ю":"yu","я":"ya"
-}
-
-# Arduino Leonardo и распространённые USB-UART мосты, встречающиеся в совместимых платах.
-USB_SERIAL_VIDS = {
-    0x2341,  # Arduino LLC
-    0x2A03,  # Arduino (старые/совместимые идентификаторы)
-    0x1A86,  # CH340/CH341
-    0x10C4,  # Silicon Labs CP210x
-    0x0403,  # FTDI
-    0x067B,  # Prolific
-}
-
-
-def to_ascii(text):
-    result = []
-    for char in text:
-        low = char.lower()
-        if low in TRANSLIT:
-            value = TRANSLIT[low]
-            result.append(value.capitalize() if char.isupper() else value)
-        else:
-            result.append(char)
-    return "".join(result)
-
-
-class PortLock:
-    """Межпроцессная блокировка порта; ОС снимает её при завершении процесса."""
-    def __init__(self, port_name):
-        normalized = os.path.normcase(os.path.realpath(port_name)).lower()
-        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
-        lock_dir = os.path.join(os.path.expanduser("~"), ".chat-com-locks")
-        os.makedirs(lock_dir, exist_ok=True)
-        self.path = os.path.join(lock_dir, f"{digest}.lock")
-        self.file = None
-
-    def acquire(self):
-        self.file = open(self.path, "a+b")
-        try:
-            if os.name == "nt":
-                import msvcrt
-                self.file.seek(0, os.SEEK_END)
-                if self.file.tell() == 0:
-                    self.file.write(b"0")
-                    self.file.flush()
-                self.file.seek(0)
-                try:
-                    msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
-                except OSError:
-                    self.file.close()
-                    self.file = None
-                    return False
-            else:
-                import fcntl
-                try:
-                    fcntl.flock(self.file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except (BlockingIOError, OSError) as exc:
-                    if exc.errno in (errno.EACCES, errno.EAGAIN, None):
-                        self.file.close()
-                        self.file = None
-                        return False
-                    raise
-            return True
-        except Exception:
-            if self.file:
-                self.file.close()
-                self.file = None
-            raise
-
-    def release(self):
-        if not self.file:
-            return
-        try:
-            if os.name == "nt":
-                import msvcrt
-                self.file.seek(0)
-                msvcrt.locking(self.file.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(self.file.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        finally:
-            self.file.close()
-            self.file = None
-
-
-class ArduinoManager:
-    def __init__(self):
-        self.serial = None
-        self.port_name = None
-        self.only_sender_name = True
-        self.send_utf8 = True
-        self.status_callback = None
-        self._lock = threading.RLock()
-        self._ready = False
-        self._port_lock = None
-        self._ports_cache = {}
-
-    @property
-    def is_connected(self):
-        return self.serial is not None and getattr(self.serial, "is_open", False) and self._ready
-
-    @staticmethod
-    def _is_usb_serial_port(port):
-        """Отсекает Bluetooth/debug-console и оставляет USB serial устройства."""
-        device = (getattr(port, "device", "") or "").lower()
-        description = (getattr(port, "description", "") or "").lower()
-        manufacturer = (getattr(port, "manufacturer", "") or "").lower()
-        product = (getattr(port, "product", "") or "").lower()
-        vid = getattr(port, "vid", None)
-
-        if any(word in device for word in ("bluetooth", "debug-console", "debug_console", "wlan")):
-            return False
-
-        if vid in USB_SERIAL_VIDS:
-            return True
-
-        if sys.platform == "darwin":
-            return device.startswith(("/dev/cu.usbmodem", "/dev/cu.usbserial", "/dev/cu.wchusbserial"))
-        if sys.platform.startswith("linux"):
-            return device.startswith(("/dev/ttyacm", "/dev/ttyusb"))
-        if os.name == "nt":
-            text = " ".join((description, manufacturer, product))
-            return bool(re.search(r"arduino|usb.?serial|ch340|ch341|cp210|ftdi|prolific", text))
-        return False
-
-    def list_ports(self):
-        try:
-            from serial.tools import list_ports
-            found = [p for p in list_ports.comports() if self._is_usb_serial_port(p)]
-            self._ports_cache = {p.device: p for p in found}
-            return sorted(self._ports_cache)
-        except Exception:
-            self._ports_cache = {}
-            return []
-
-    @staticmethod
-    def _is_busy_error(exc):
-        message = str(exc).lower()
-        return (
-            isinstance(exc, PermissionError)
-            or getattr(exc, "errno", None) in (errno.EBUSY, errno.EACCES, errno.EPERM)
-            or any(part in message for part in ("resource busy", "device or resource busy", "permission denied", "access is denied", "access denied", "already open"))
-        )
-
-    def connect(self, port_name):
-        self.disconnect()
-        if not port_name:
-            return False, "Не выбран USB-порт Arduino."
-
-        # Повторно проверяем наличие устройства: не доверяем старому списку в ComboBox.
-        available = self.list_ports()
-        if port_name not in available:
-            return False, (
-                f"Устройство {port_name} не найдено среди USB-последовательных портов. "
-                "Нажмите «Обновить порты» и проверьте USB-подключение."
-            )
-
-        lock = PortLock(port_name)
-        try:
-            if not lock.acquire():
-                return False, f"Порт {port_name} уже занят другим экземпляром клиента. Нет доступа к Arduino."
-            self._port_lock = lock
-
-            import serial
-            serial_args = dict(
-                port=port_name,
-                baudrate=9600,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=0.1,
-                write_timeout=0.5,
-            )
-            # На macOS/Linux просим драйвер открыть порт эксклюзивно.
-            if os.name != "nt":
-                serial_args["exclusive"] = True
-
-            opened = serial.Serial(**serial_args)
-            if not opened.is_open:
-                opened.close()
-                raise serial.SerialException("Операционная система не подтвердила открытие порта")
-
-            self.serial = opened
-            self.port_name = port_name
-            self._ready = False
-
-            # Arduino Leonardo перезапускается после открытия USB CDC.
-            time.sleep(2.5)
-            if not self.serial or not self.serial.is_open:
-                raise serial.SerialException("Порт закрылся во время инициализации платы")
-
-            # Успех означает: найден USB serial-девайс, порт открыт эксклюзивно,
-            # резервирование удерживается до disconnect(). Протокольный handshake
-            # зависит от прошивки и здесь намеренно не выдумывается.
-            self._ready = True
-            return True, f"Arduino/USB-устройство подключено: {port_name} (9600, 8N1)"
-
-        except Exception as exc:
-            self.disconnect()
-            if self._is_busy_error(exc):
-                return False, f"Порт {port_name} уже занят другой программой или клиентом. Закройте её и повторите подключение."
-            return False, f"Не удалось подключить устройство через {port_name}: {exc}"
-
-    def disconnect(self):
-        with self._lock:
-            old_serial = self.serial
-            old_lock = self._port_lock
-            self.serial = None
-            self.port_name = None
-            self._port_lock = None
-            self._ready = False
-            try:
-                if old_serial and getattr(old_serial, "is_open", False):
-                    old_serial.close()
-            except Exception:
-                pass
-            finally:
-                if old_lock:
-                    old_lock.release()
-
-    def format_for_display(self, line):
-        if not line:
-            return None
-        if line.startswith(("OK ", "TFT ", "READY", ">>", "~")):
-            return None
-
-        prefix = ""
-        body = line
-        if line.startswith("[PM] -> @ "):
-            body = line[len("[PM] -> @ "):]
-            prefix = "->@"
-        elif line.startswith("[PM] @ "):
-            body = line[len("[PM] @ "):]
-            prefix = "@"
-
-        colon = body.find(":")
-        if colon <= 0:
-            return None
-        who = body[:colon].strip()
-        text = body[colon + 1:].strip()
-        text = re.sub(r"\s+\(сообщение #(\d+)\)\s*$", r" (#\1)", text)
-        if self.only_sender_name:
-            return prefix + who
-        return prefix + who + ": " + text
-
-    def send_chat_line(self, line):
-        formatted = self.format_for_display(line)
-        if not formatted or not self.is_connected:
-            return
-        if not self.send_utf8:
-            formatted = to_ascii(formatted)
-        formatted = formatted[:160]
-
-        def writer():
-            try:
-                with self._lock:
-                    if self.serial and self.serial.is_open and self._ready:
-                        self.serial.write((formatted + "\n").encode("utf-8"))
-                        self.serial.flush()
-            except Exception as exc:
-                failed_port = self.port_name or "Arduino"
-                self.disconnect()
-                if self.status_callback:
-                    self.status_callback(f"[COM] Потеряно соединение с {failed_port}: {exc}")
-
-        threading.Thread(target=writer, daemon=True).start()
-
-
-class SocketLineReader:
-    """Читает TCP-поток построчно, не предполагая, что recv() совпадает с сообщением."""
-    def __init__(self, sock):
-        self.sock = sock
-        self.buffer = bytearray()
-
-    def readline(self):
-        while b"\n" not in self.buffer:
-            chunk = self.sock.recv(4096)
-            if not chunk:
-                if self.buffer:
-                    data = bytes(self.buffer)
-                    self.buffer.clear()
-                    return data.decode("utf-8", errors="replace").rstrip("\r")
-                return ""
-            self.buffer.extend(chunk)
-        line, _, rest = self.buffer.partition(b"\n")
-        self.buffer = bytearray(rest)
-        return line.decode("utf-8", errors="replace").rstrip("\r")
-
-
-def validate_name(name: str):
-    name = clean_text(name or "")
-    if not name:
-        return "Имя не может быть пустым."
-    if len(name) > 20:
-        return "Имя слишком длинное (максимум 20 символов)."
-    if any(ch.isspace() for ch in name):
-        return "Имя должно быть одним словом без пробелов и табов."
-    if any(ch in name for ch in "@#*:"):
-        return "Имя не может содержать символы @, #, *, :."
-    if name.lower() in {"exit", "help", "agent", "system", "server", "admin", "root"}:
-        return f"Имя «{name}» зарезервировано."
-    return None
-
-
+# ============================================================
+# ГРАФИК
+# ============================================================
 
 class GraphCanvas(FigureCanvasQTAgg):
-    """Интерактивный график с масштабированием, перемещением и выбором точек."""
 
     def __init__(self, parent=None):
-        self.figure = Figure(figsize=(6, 3.2), dpi=100, facecolor="#FFFFFF")
+        self.figure = Figure(figsize=(8, 5), dpi=100)
         super().__init__(self.figure)
+
         self.setParent(parent)
+        self.setMinimumSize(400, 300)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self.ax = self.figure.add_subplot(111)
 
-        self.function_name = "sin"
-        self.xmin, self.xmax = 0.0, 10.0
-        self.ymin, self.ymax = -1.5, 1.5
+        self.ax.set_xlabel("x — координата", labelpad=9)
+        self.ax.set_ylabel("y — значение функции", labelpad=9)
+        self.ax.set_title("Ожидание результатов расчёта", pad=12)
 
-        self._drag_start = None
-        self._dragged = False
-        self._selected_index = None
+        self.ax.minorticks_on()
+        self.ax.grid(True, which="major", alpha=0.28, linewidth=0.8)
+        self.ax.grid(True, which="minor", alpha=0.12, linewidth=0.45)
+        self.ax.axhline(0, color="#888888", linewidth=0.7)
+        self.ax.axvline(0, color="#888888", linewidth=0.7)
 
-        self.point_info_callback = None
-
-        # Оформление графика
-        self.ax.set_facecolor("#FBFCFE")
-        self.ax.set_xlabel("x", fontsize=9)
-        self.ax.set_ylabel("y", fontsize=9)
-        self.ax.set_title(
-            "y = sin(x)",
-            fontsize=11,
-            fontweight="bold",
-            pad=10
-        )
-
-        self.ax.grid(
-            True,
-            color="#DCE3EA",
-            linewidth=0.8,
-            alpha=0.9
-        )
-
-        self.ax.axhline(0, color="#687586", linewidth=0.9, zorder=1)
-        self.ax.axvline(0, color="#687586", linewidth=0.9, zorder=1)
-
-        self.ax.tick_params(labelsize=8, colors="#465365")
-
-        for spine in self.ax.spines.values():
-            spine.set_color("#C9D2DC")
-
-        # Основная линия функции
-        self.curve, = self.ax.plot(
+        # Основная линия
+        self.line, = self.ax.plot(
             [],
             [],
-            color="#2878B5",
-            linewidth=2.2,
-            solid_capstyle="round",
+            color="#1976D2",
+            linewidth=1.8,
+            label="Функция"
+        )
+
+        # Точки расчёта
+        self.points = self.ax.scatter(
+            [],
+            [],
+            s=13,
+            color="#1976D2",
             zorder=3
         )
 
-        # Маркер выбранной точки
-        self.selected_marker, = self.ax.plot(
+        # Выделенная точка
+        self.selected_point = self.ax.scatter(
             [],
             [],
-            marker="o",
-            markersize=8,
-            markerfacecolor="#F59E0B",
-            markeredgecolor="#FFFFFF",
-            markeredgewidth=1.5,
-            linestyle="None",
-            zorder=6
+            s=85,
+            color="#E53935",
+            edgecolors="white",
+            linewidths=1.2,
+            zorder=5
         )
 
-        # Всплывающая подпись координат
+        # Подсказка с координатами
         self.annotation = self.ax.annotate(
             "",
             xy=(0, 0),
-            xytext=(12, 14),
+            xytext=(12, 12),
             textcoords="offset points",
             bbox=dict(
                 boxstyle="round,pad=0.4",
-                fc="#172334",
-                ec="none",
-                alpha=0.94
+                fc="white",
+                ec="#888888",
+                alpha=0.95
             ),
-            color="white",
-            fontsize=8,
             arrowprops=dict(
                 arrowstyle="->",
-                color="#172334",
-                lw=0.8
+                color="#555555"
             ),
+            fontsize=9,
             zorder=10
         )
 
         self.annotation.set_visible(False)
 
-        self.ax.set_xlim(self.xmin, self.xmax)
-        self.ax.set_ylim(self.ymin, self.ymax)
+        self.x_data = []
+        self.y_data = []
 
-        self._redraw_function()
-        self.figure.tight_layout(pad=2.0)
+        self.auto_scale = True
+        self.coordinate_callback = None
 
-        # Обработчики событий мыши
-        self.mpl_connect("scroll_event", self._on_scroll)
-        self.mpl_connect("button_press_event", self._on_press)
-        self.mpl_connect("motion_notify_event", self._on_motion)
-        self.mpl_connect("button_release_event", self._on_release)
-        self.mpl_connect("axes_leave_event", self._on_axes_leave)
+        # Перемещение графика
+        self.pan_active = False
+        self.pan_start = None
+        self.pan_xlim = None
+        self.pan_ylim = None
+        self.dragged = False
 
-    def _function(self, x):
-        if self.function_name == "sin":
-            return np.sin(x)
+        # Подключение событий Matplotlib
+        self.mpl_connect("scroll_event", self.on_scroll)
+        self.mpl_connect("button_press_event", self.on_press)
+        self.mpl_connect("button_release_event", self.on_release)
+        self.mpl_connect("motion_notify_event", self.on_motion)
 
-        return np.cos(x)
+        self.figure.tight_layout()
 
-    def _redraw_function(self):
-        """Перестраивает кривую для текущего диапазона оси X."""
+    # --------------------------------------------------------
+    # Отображение нового кадра
+    # --------------------------------------------------------
 
-        x0, x1 = self.ax.get_xlim()
+    def show_frame(self, frame):
 
-        count = int(min(6000, max(1200, abs(x1 - x0) * 180)))
+        xs = frame.get("x", [])
+        ys = frame.get("y", [])
 
-        self.x_values = np.linspace(x0, x1, count)
-        self.y_values = self._function(self.x_values)
-
-        self.curve.set_data(self.x_values, self.y_values)
-
-        title = (
-            "y = sin(x)"
-            if self.function_name == "sin"
-            else "y = cos(x)"
-        )
-
-        self.ax.set_title(
-            title,
-            fontsize=11,
-            fontweight="bold",
-            pad=10
-        )
-
-        self.draw_idle()
-
-    def set_function(self, name):
-        """Переключает отображаемую функцию."""
-
-        if name not in ("sin", "cos"):
+        if not isinstance(xs, list) or not isinstance(ys, list):
             return
 
-        self.function_name = name
+        if len(xs) != len(ys):
+            return
 
-        self._selected_index = None
-        self.selected_marker.set_data([], [])
-        self.annotation.set_visible(False)
+        clean_x = []
+        clean_y = []
 
-        self._redraw_function()
+        for x, y in zip(xs, ys):
 
-        self._notify_info(
-            "Наведите курсор на кривую или нажмите на неё, "
-            "чтобы узнать координаты."
-        )
+            try:
+                x = float(x)
 
-    def reset_view(self):
-        """Возвращает исходный масштаб."""
+                if y is None:
+                    y = math.nan
+                else:
+                    y = float(y)
 
-        self.ax.set_xlim(0.0, 10.0)
-        self.ax.set_ylim(-1.5, 1.5)
+                if not math.isfinite(x):
+                    continue
 
-        self._selected_index = None
-        self.selected_marker.set_data([], [])
-        self.annotation.set_visible(False)
+                if not math.isfinite(y):
+                    y = math.nan
 
-        self._redraw_function()
+                clean_x.append(x)
+                clean_y.append(y)
 
-        self._notify_info("Исходный масштаб: X от 0 до 10.")
+            except (TypeError, ValueError):
+                continue
 
-    def set_x_range(self, xmin, xmax):
-        """Устанавливает пользовательский диапазон X."""
+        self.x_data = clean_x
+        self.y_data = clean_y
 
-        if not (
-            math.isfinite(xmin)
-            and math.isfinite(xmax)
-            and xmin < xmax
-        ):
-            return False
+        # Обновляем линию и точки
+        self.line.set_data(clean_x, clean_y)
 
-        if xmax - xmin < 1e-6:
-            return False
+        valid_points = [
+            (x, y)
+            for x, y in zip(clean_x, clean_y)
+            if math.isfinite(y)
+        ]
 
-        self.ax.set_xlim(xmin, xmax)
-        self._redraw_function()
+        if valid_points:
+            px = [p[0] for p in valid_points]
+            py = [p[1] for p in valid_points]
 
-        return True
-
-    def _notify_info(self, text):
-        if callable(self.point_info_callback):
-            self.point_info_callback(text)
-
-    def _nearest_point(self, event):
-        """Находит ближайшую точку кривой в экранных координатах."""
-
-        if event.inaxes != self.ax or event.xdata is None:
-            return None
-
-        points = np.column_stack(
-            (self.x_values, self.y_values)
-        )
-
-        pixels = self.ax.transData.transform(points)
-        cursor = np.array([event.x, event.y])
-
-        distances = np.sqrt(
-            np.sum((pixels - cursor) ** 2, axis=1)
-        )
-
-        index = int(np.argmin(distances))
-
-        # Допустимое расстояние до кривой — 18 пикселей
-        if distances[index] > 18:
-            return None
-
-        return index
-
-    def _show_point(self, index, selected=False):
-        """Показывает координаты найденной точки."""
-
-        x = float(self.x_values[index])
-        y = float(self.y_values[index])
-
-        self.annotation.xy = (x, y)
-        self.annotation.set_text(
-            f"x = {x:.6f}\ny = {y:.6f}"
-        )
-
-        self.annotation.set_visible(True)
-
-        if selected:
-            self._selected_index = index
-
-            self.selected_marker.set_data(
-                [x],
-                [y]
-            )
-
-            self._notify_info(
-                f"Выбранная точка: "
-                f"x = {x:.6f}   |   y = {y:.6f}"
-            )
+            self.points.set_offsets(list(zip(px, py)))
         else:
-            self._notify_info(
-                f"Координаты курсора: "
-                f"x = {x:.5f}   |   y = {y:.5f}"
-            )
+            self.points.set_offsets([[math.nan, math.nan]])
+
+        self.selected_point.set_offsets([[math.nan, math.nan]])
+        self.annotation.set_visible(False)
+        if self.coordinate_callback:
+            self.coordinate_callback("Координаты: наведите курсор на точку графика")
+
+        formula = frame.get("formula", "Функция")
+        t = frame.get("t", 0)
+
+        frame_number = int(frame.get("k", 0)) + 1
+        total_frames = int(frame.get("total", frame_number))
+        self.ax.set_title(
+            f"{formula}    |    кадр {frame_number}/{total_frames}    |    t = {t:.6g}",
+            wrap=True
+        )
+
+        # Автоматическое масштабирование выполняется,
+        # только если пользователь сам не изменил масштаб.
+        if self.auto_scale:
+            self.fit_view()
 
         self.draw_idle()
 
-    def _on_scroll(self, event):
-        """Масштабирование относительно положения курсора."""
+    # --------------------------------------------------------
+    # Автоматическое масштабирование
+    # --------------------------------------------------------
 
-        if (
-            event.inaxes != self.ax
-            or event.xdata is None
-            or event.ydata is None
-        ):
+    def fit_view(self):
+
+        if not self.x_data:
+            self.ax.set_xlim(-1, 1)
+            self.ax.set_ylim(-1, 1)
+            self.draw_idle()
             return
 
-        scale = 0.82 if event.button == "up" else 1.22
+        valid = [
+            (x, y)
+            for x, y in zip(self.x_data, self.y_data)
+            if math.isfinite(y)
+        ]
 
-        x_left, x_right = self.ax.get_xlim()
-        y_bottom, y_top = self.ax.get_ylim()
+        if not valid:
+            xmin = min(self.x_data)
+            xmax = max(self.x_data)
 
-        new_width = (x_right - x_left) * scale
-        new_height = (y_top - y_bottom) * scale
+            if xmin == xmax:
+                xmin -= 1
+                xmax += 1
 
-        rel_x = (
-            (event.xdata - x_left)
-            / (x_right - x_left)
-        )
+            self.ax.set_xlim(xmin, xmax)
+            self.ax.set_ylim(-1, 1)
+            self.draw_idle()
+            return
 
-        rel_y = (
-            (event.ydata - y_bottom)
-            / (y_top - y_bottom)
-        )
+        xs = [p[0] for p in valid]
+        ys = [p[1] for p in valid]
 
+        xmin = min(xs)
+        xmax = max(xs)
+        ymin = min(ys)
+        ymax = max(ys)
+
+        dx = xmax - xmin
+        dy = ymax - ymin
+
+        if dx == 0:
+            dx = 1
+
+        if dy == 0:
+            dy = max(abs(ymin) * 0.1, 1)
+
+        # Небольшие отступы по краям
         self.ax.set_xlim(
-            event.xdata - new_width * rel_x,
-            event.xdata + new_width * (1 - rel_x)
+            xmin - dx * 0.04,
+            xmax + dx * 0.04
         )
 
         self.ax.set_ylim(
-            event.ydata - new_height * rel_y,
-            event.ydata + new_height * (1 - rel_y)
+            ymin - dy * 0.12,
+            ymax + dy * 0.12
         )
 
-        self._redraw_function()
+        self.draw_idle()
 
-    def _on_press(self, event):
+    def reset_view(self):
+        self.auto_scale = True
+        self.fit_view()
+
+    # --------------------------------------------------------
+    # Масштабирование относительно курсора
+    # --------------------------------------------------------
+
+    def _zoom_at(self, x, y, scale):
+        if x is None or y is None or not math.isfinite(scale) or scale <= 0:
+            return
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        self.ax.set_xlim(
+            x - (x - xlim[0]) * scale,
+            x + (xlim[1] - x) * scale
+        )
+        self.ax.set_ylim(
+            y - (y - ylim[0]) * scale,
+            y + (ylim[1] - y) * scale
+        )
+        self.auto_scale = False
+        self.draw_idle()
+
+    def on_scroll(self, event):
+        if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
+            return
+
+        # Дробный шаг учитывает плавную прокрутку тачпада.
+        step = float(getattr(event, "step", 0) or 0)
+        if step == 0:
+            button = getattr(event, "button", None)
+            step = 1.0 if button == "up" else (-1.0 if button == "down" else 0.0)
+        if step == 0:
+            return
+
+        scale = math.exp(-step * 0.18)
+        scale = min(2.5, max(0.4, scale))
+        self._zoom_at(event.xdata, event.ydata, scale)
+
+    def event(self, event):
+        # Нативный pinch-to-zoom на тачпадах и сенсорных панелях Qt.
+        if event.type() == QEvent.Type.NativeGesture:
+            zoom_type = getattr(Qt.NativeGestureType, "ZoomNativeGesture", None)
+            if zoom_type is not None and event.gestureType() == zoom_type:
+                try:
+                    pos = event.position()
+                    ratio = float(self.devicePixelRatioF())
+                    px = pos.x() * ratio
+                    py = self.figure.bbox.height - pos.y() * ratio
+                    if not self.ax.bbox.contains(px, py):
+                        return super().event(event)
+                    x, y = self.ax.transData.inverted().transform((px, py))
+                    value = float(event.value())
+                    scale = 1.0 / max(0.2, 1.0 + value)
+                    self._zoom_at(x, y, min(2.5, max(0.4, scale)))
+                    event.accept()
+                    return True
+                except (AttributeError, TypeError, ValueError):
+                    pass
+        return super().event(event)
+
+    # --------------------------------------------------------
+    # Начало перемещения
+    # --------------------------------------------------------
+
+    def on_press(self, event):
+
         if event.inaxes != self.ax:
             return
 
-        # Не вмешиваемся в штатные режимы Matplotlib
-        toolbar = getattr(self, "toolbar", None)
-
-        if toolbar is not None and toolbar.mode:
+        if event.button != 1:
             return
 
-        if (
-            event.button == 1
-            and event.xdata is not None
-            and event.ydata is not None
-        ):
-            self._drag_start = (
-                event.x,
-                event.y,
-                event.xdata,
-                event.ydata
-            )
-
-            self._dragged = False
-
-    def _on_motion(self, event):
-        if event.inaxes != self.ax:
-            if self._drag_start is None:
-                self.annotation.set_visible(False)
-                self.draw_idle()
-
+        if event.x is None or event.y is None:
             return
 
-        # Перемещение графика перетаскиванием
-        if (
-            self._drag_start is not None
-            and event.xdata is not None
-            and event.ydata is not None
-        ):
-            sx, sy, start_x, start_y = self._drag_start
+        self.pan_active = True
+        self.dragged = False
 
-            dx_pixels = event.x - sx
-            dy_pixels = event.y - sy
+        self.pan_start = (event.x, event.y)
+        self.pan_xlim = self.ax.get_xlim()
+        self.pan_ylim = self.ax.get_ylim()
 
-            if abs(dx_pixels) + abs(dy_pixels) > 4:
-                self._dragged = True
+    # --------------------------------------------------------
+    # Перемещение графика
+    # --------------------------------------------------------
 
-                x0, x1 = self.ax.get_xlim()
-                y0, y1 = self.ax.get_ylim()
+    def on_motion(self, event):
 
-                dx = event.xdata - start_x
-                dy = event.ydata - start_y
+        if self.pan_active:
 
-                self.ax.set_xlim(x0 - dx, x1 - dx)
-                self.ax.set_ylim(y0 - dy, y1 - dy)
-
-                self._redraw_function()
+            if event.x is None or event.y is None:
                 return
 
-        # Отображение координат при наведении
-        index = self._nearest_point(event)
+            dx = event.x - self.pan_start[0]
+            dy = event.y - self.pan_start[1]
 
-        if index is not None:
-            self._show_point(index)
+            if abs(dx) > 3 or abs(dy) > 3:
+                self.dragged = True
 
-        elif self._selected_index is None:
-            self.annotation.set_visible(False)
+            if not self.dragged:
+                return
 
-            self._notify_info(
-                f"x = {event.xdata:.5f}   |   "
-                f"y = {event.ydata:.5f}"
-                if event.xdata is not None
-                and event.ydata is not None
-                else "Наведите курсор на кривую."
+            bbox = self.ax.get_window_extent()
+
+            if bbox.width <= 0 or bbox.height <= 0:
+                return
+
+            x_range = self.pan_xlim[1] - self.pan_xlim[0]
+            y_range = self.pan_ylim[1] - self.pan_ylim[0]
+
+            shift_x = -dx / bbox.width * x_range
+            shift_y = -dy / bbox.height * y_range
+
+            self.ax.set_xlim(
+                self.pan_xlim[0] + shift_x,
+                self.pan_xlim[1] + shift_x
             )
 
-            self.draw_idle()
+            self.ax.set_ylim(
+                self.pan_ylim[0] + shift_y,
+                self.pan_ylim[1] + shift_y
+            )
 
-    def _on_release(self, event):
-        if self._drag_start is None:
+            self.auto_scale = False
+            self.draw_idle()
             return
 
-        was_dragged = self._dragged
+        # Если не перемещаем график — ищем ближайшую точку
+        if event.inaxes != self.ax or event.xdata is None:
+            return
 
-        self._drag_start = None
-        self._dragged = False
+        self.update_hover(event)
 
-        # Если мышь не перемещалась, считаем действие выбором точки
-        if not was_dragged and event.inaxes == self.ax:
-            index = self._nearest_point(event)
+    # --------------------------------------------------------
+    # Завершение перемещения или выбор точки
+    # --------------------------------------------------------
 
-            if index is not None:
-                self._show_point(index, selected=True)
+    def on_release(self, event):
 
-    def _on_axes_leave(self, event):
-        if (
-            self._drag_start is None
-            and self._selected_index is None
-        ):
-            self.annotation.set_visible(False)
-            self.draw_idle()
+        if not self.pan_active:
+            return
 
-class ChatClientWindow(QMainWindow):
+        was_dragged = self.dragged
+
+        self.pan_active = False
+        self.pan_start = None
+
+        if not was_dragged:
+            self.select_nearest_point(event)
+
+    # --------------------------------------------------------
+    # Поиск ближайшей точки при наведении
+    # --------------------------------------------------------
+
+    def find_nearest_point(self, event):
+
+        if event.x is None or event.y is None:
+            return None
+
+        best_index = None
+        best_distance = float("inf")
+
+        for i, (x, y) in enumerate(zip(self.x_data, self.y_data)):
+
+            if not math.isfinite(y):
+                continue
+
+            px, py = self.ax.transData.transform((x, y))
+
+            distance = math.hypot(
+                px - event.x,
+                py - event.y
+            )
+
+            if distance < best_distance:
+                best_distance = distance
+                best_index = i
+
+        # Радиус поиска в пикселях
+        if best_distance <= 14:
+            return best_index
+
+        return None
+
+    def update_hover(self, event):
+
+        index = self.find_nearest_point(event)
+
+        if index is None:
+            if self.annotation.get_visible():
+                self.annotation.set_visible(False)
+                self.draw_idle()
+            if self.coordinate_callback:
+                self.coordinate_callback("Координаты: наведите курсор на точку графика")
+            return
+
+        x = self.x_data[index]
+        y = self.y_data[index]
+
+        self.annotation.xy = (x, y)
+        self.annotation.set_text(
+            f"x = {x:.7g}\ny = {y:.7g}"
+        )
+
+        self.annotation.set_visible(True)
+        if self.coordinate_callback:
+            self.coordinate_callback(f"x = {x:.9g}    |    y = {y:.9g}")
+        self.draw_idle()
+
+    # --------------------------------------------------------
+    # Выбор точки
+    # --------------------------------------------------------
+
+    def select_nearest_point(self, event):
+
+        if event.inaxes != self.ax:
+            return
+
+        index = self.find_nearest_point(event)
+
+        if index is None:
+            return
+
+        x = self.x_data[index]
+        y = self.y_data[index]
+
+        self.selected_point.set_offsets([[x, y]])
+
+        self.annotation.xy = (x, y)
+        self.annotation.set_text(
+            f"Точка №{index + 1}\n"
+            f"x = {x:.8g}\n"
+            f"y = {y:.8g}"
+        )
+
+        self.annotation.set_visible(True)
+        if self.coordinate_callback:
+            self.coordinate_callback(
+                f"Выбрана точка №{index + 1}:  x = {x:.9g}    |    y = {y:.9g}"
+            )
+        self.draw_idle()
+
+    # --------------------------------------------------------
+    # Кнопки масштабирования
+    # --------------------------------------------------------
+
+    def zoom(self, factor):
+
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+
+        cx = (xlim[0] + xlim[1]) / 2
+        cy = (ylim[0] + ylim[1]) / 2
+
+        half_x = (xlim[1] - xlim[0]) * factor / 2
+        half_y = (ylim[1] - ylim[0]) * factor / 2
+
+        self.ax.set_xlim(cx - half_x, cx + half_x)
+        self.ax.set_ylim(cy - half_y, cy + half_y)
+
+        self.auto_scale = False
+        self.draw_idle()
+
+
+# ============================================================
+# ГЛАВНОЕ ОКНО
+# ============================================================
+
+class MainWindow(QMainWindow):
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Оконный клиент чата — не подключён")
+
+        self.setWindowTitle(
+            "Лабораторная работа №4 — удалённый расчёт"
+        )
+
         self.resize(1450, 900)
-        self.setMinimumSize(1050, 700)
 
         self.sock = None
-        self.reader_thread = None
-        self.reader_stop = threading.Event()
-        self.incoming = queue.Queue()
-        self.connected = False
-        self.my_name = ""
-        self.users = set()
-        self.user_colors = {}
-        self.color_index = 0
-        self.pending_general_echoes = deque()
-        self.pending_pm_echoes = deque()
-        self.users_block = False
-        self.users_buffer = []
-        self.last_users_request = 0.0
+        self.send_lock = threading.Lock()
 
-        self.stats = ChatStatistics()
-        self.arduino = ArduinoManager()
+        self.reader_stop = threading.Event()
+        self.reader = None
+
+        self.incoming = queue.Queue()
+
+        self.catalog = []
+        self.frames = []
+
+        self.running = False
+        self.paused = False
+        self.run_id = None
+
+        self.param_widgets = []
+
         self._build_ui()
 
-        self.poll_timer = QTimer(self)
-        self.poll_timer.timeout.connect(self._process_incoming)
-        self.poll_timer.start(100)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.process_messages)
+        self.timer.start(50)
 
-        self.heartbeat_timer = QTimer(self)
-        self.heartbeat_timer.timeout.connect(self._send_ping)
-        self.users_timer = QTimer(self)
-        self.users_timer.timeout.connect(self._request_users)
-
-        self.arduino.status_callback = self._show_status
+    # --------------------------------------------------------
+    # Интерфейс
+    # --------------------------------------------------------
 
     def _build_ui(self):
+
         central = QWidget()
         self.setCentralWidget(central)
-        main = QVBoxLayout(central)
 
+        root = QVBoxLayout(central)
+
+        # Подключение
         connection = QGroupBox("Подключение к серверу")
-        conn_layout = QHBoxLayout(connection)
-        self.host_edit = QLineEdit(DEFAULT_HOST)
+        row = QHBoxLayout(connection)
+
+        self.host_edit = QLineEdit("127.0.0.1")
+
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
-        self.port_spin.setValue(DEFAULT_PORT)
-        self.connect_button = QPushButton("Подключиться")
-        self.disconnect_button = QPushButton("Отключиться")
-        self.disconnect_button.setEnabled(False)
-        conn_layout.addWidget(QLabel("Адрес:"))
-        conn_layout.addWidget(self.host_edit, 2)
-        conn_layout.addWidget(QLabel("Порт:"))
-        conn_layout.addWidget(self.port_spin)
-        conn_layout.addWidget(self.connect_button)
-        conn_layout.addWidget(self.disconnect_button)
-        main.addWidget(connection)
+        self.port_spin.setValue(5124)
 
-        splitter = QSplitter(Qt.Horizontal)
-        main.addWidget(splitter, 5)
+        self.connect_btn = QPushButton("Подключиться")
+        self.disconnect_btn = QPushButton("Отключиться")
+        self.disconnect_btn.setEnabled(False)
 
-        # Левая колонка — пользователи и управление.
+        self.refresh_btn = QPushButton("Обновить функции")
+
+        row.addWidget(QLabel("Адрес:"))
+        row.addWidget(self.host_edit)
+        row.addWidget(QLabel("Порт:"))
+        row.addWidget(self.port_spin)
+        row.addWidget(self.connect_btn)
+        row.addWidget(self.disconnect_btn)
+        row.addWidget(self.refresh_btn)
+
+        root.addWidget(connection)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Левая панель
         left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.addWidget(QLabel("Участники чата"))
-        self.users_list = QListWidget()
-        self.users_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.users_list.customContextMenuRequested.connect(self._user_context_menu)
-        left_layout.addWidget(self.users_list, 1)
-        self.rename_button = QPushButton("Переименовать себя")
-        self.rename_button.setEnabled(False)
-        left_layout.addWidget(self.rename_button)
+        lv = QVBoxLayout(left)
 
-        arduino_box = QGroupBox("Arduino Leonardo / TFT")
-        arduino_layout = QFormLayout(arduino_box)
-        self.port_combo = QComboBox()
-        self.refresh_ports_button = QPushButton("Обновить порты")
-        port_row = QWidget()
-        port_row_layout = QHBoxLayout(port_row)
-        port_row_layout.setContentsMargins(0, 0, 0, 0)
-        port_row_layout.addWidget(self.port_combo, 1)
-        port_row_layout.addWidget(self.refresh_ports_button)
-        self.arduino_connect_button = QPushButton("Подключить Arduino")
-        self.arduino_disconnect_button = QPushButton("Отключить Arduino")
-        self.arduino_disconnect_button.setEnabled(False)
-        self.arduino_status = QLabel("Не подключена")
-        self.mode_button = QPushButton("Режим дисплея: имя")
-        self.enc_button = QPushButton("Кодировка: UTF-8")
-        arduino_layout.addRow("COM-порт:", port_row)
-        arduino_layout.addRow(self.arduino_connect_button)
-        arduino_layout.addRow(self.arduino_disconnect_button)
-        arduino_layout.addRow("Состояние:", self.arduino_status)
-        arduino_layout.addRow(self.mode_button)
-        arduino_layout.addRow(self.enc_button)
-        left_layout.addWidget(arduino_box)
+        settings = QGroupBox("Параметры расчёта")
+        form = QFormLayout(settings)
+
+        self.function_combo = QComboBox()
+        self.function_combo.setEnabled(False)
+
+        self.formula_label = QLabel(
+            "Подключитесь к серверу для загрузки функций."
+        )
+        self.formula_label.setWordWrap(True)
+
+        form.addRow("Функция из DLL:", self.function_combo)
+        form.addRow("Формула:", self.formula_label)
+
+        # Диапазоны
+        ranges = QGridLayout()
+
+        self.x_from = self._double(0)
+        self.x_to = self._double(10)
+        self.x_step = self._double(0.05, 0.000001)
+
+        self.t_from = self._double(0)
+        self.t_to = self._double(5)
+        self.t_step = self._double(0.1, 0.000001)
+
+        fields = [
+            ("x от", self.x_from),
+            ("x до", self.x_to),
+            ("шаг x", self.x_step),
+            ("t от", self.t_from),
+            ("t до", self.t_to),
+            ("шаг t", self.t_step)
+        ]
+
+        for i, (label, widget) in enumerate(fields):
+
+            r, c = divmod(i, 3)
+
+            ranges.addWidget(QLabel(label), r, c * 2)
+            ranges.addWidget(widget, r, c * 2 + 1)
+
+        form.addRow("Диапазоны:", ranges)
+
+        # Параметры функции
+        self.params_box = QWidget()
+        self.params_layout = QHBoxLayout(self.params_box)
+        self.params_layout.setContentsMargins(0, 0, 0, 0)
+
+        form.addRow("Параметры функции:", self.params_box)
+
+        # Настройки передачи
+        extra = QHBoxLayout()
+
+        self.emit_spin = QSpinBox()
+        self.emit_spin.setRange(10, 10000)
+        self.emit_spin.setValue(200)
+
+        self.complexity_spin = QSpinBox()
+        self.complexity_spin.setRange(1, 40000)
+        self.complexity_spin.setValue(20000)
+
+        extra.addWidget(QLabel("Интервал emit, мс:"))
+        extra.addWidget(self.emit_spin)
+
+        extra.addWidget(QLabel("Нагрузка CPU:"))
+        extra.addWidget(self.complexity_spin)
+
+        form.addRow("Передача:", extra)
+
+        lv.addWidget(settings)
+
+        # Управление расчётом
+        buttons = QHBoxLayout()
+
+        self.start_btn = QPushButton("Начать расчёт")
+        self.pause_btn = QPushButton("Пауза")
+
+        self.start_btn.setEnabled(False)
+        self.pause_btn.setEnabled(False)
+
+        buttons.addWidget(self.start_btn)
+        buttons.addWidget(self.pause_btn)
+
+        lv.addLayout(buttons)
+
+        self.progress_label = QLabel("Ожидание подключения.")
+        self.cpu_label = QLabel("Загрузка CPU процесса сервера: —")
+
+        lv.addWidget(self.progress_label)
+        lv.addWidget(self.cpu_label)
+
+        # Журнал
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumHeight(220)
+
+        lv.addWidget(self.log)
+
         splitter.addWidget(left)
 
-        # Центральная колонка — чат.
-        center = QWidget()
-        center_layout = QVBoxLayout(center)
-        center_layout.addWidget(QLabel("Лента сообщений"))
-        self.chat_view = QTextEdit()
-        self.chat_view.setReadOnly(True)
-        self.chat_view.setStyleSheet("QTextEdit { background: #FFFFFF; }")
-        center_layout.addWidget(self.chat_view, 1)
-        send_row = QHBoxLayout()
-        self.message_edit = QLineEdit()
-        self.message_edit.setPlaceholderText("Введите сообщение и нажмите Enter…")
-        self.send_button = QPushButton("Отправить")
-        self.message_edit.setEnabled(False)
-        self.send_button.setEnabled(False)
-        send_row.addWidget(self.message_edit, 1)
-        send_row.addWidget(self.send_button)
-        center_layout.addLayout(send_row)
-        splitter.addWidget(center)
-
-        # Правая колонка — статистика и параметры.
+        # Правая панель — график
         right = QWidget()
-        right_layout = QVBoxLayout(right)
-        stats_box = QGroupBox("Статистика чата")
-        stats_layout = QVBoxLayout(stats_box)
-        self.stats_view = QTextEdit()
-        self.stats_view.setReadOnly(True)
-        self.stats_view.setMaximumHeight(210)
-        stats_layout.addWidget(self.stats_view)
-        query_row = QHBoxLayout()
-        self.stats_query = QLineEdit()
-        self.stats_query.setPlaceholderText("Имя участника или запрос: help")
-        self.stats_query_button = QPushButton("Выполнить")
-        query_row.addWidget(self.stats_query, 1)
-        query_row.addWidget(self.stats_query_button)
-        stats_layout.addLayout(query_row)
-        self.stats_answer = QLabel("Введите имя участника, чтобы узнать число его сообщений.")
-        self.stats_answer.setWordWrap(True)
-        stats_layout.addWidget(self.stats_answer)
-        right_layout.addWidget(stats_box)
+        rv = QVBoxLayout(right)
 
-        graph_box = QGroupBox("Интерактивный график")
-        graph_layout = QVBoxLayout(graph_box)
-        graph_layout.setContentsMargins(8, 10, 8, 8)
-        graph_layout.setSpacing(6)
-
-        # Панель настроек графика
-        graph_controls = QHBoxLayout()
-
-        graph_controls.addWidget(QLabel("Функция:"))
-
-        self.graph_function_combo = QComboBox()
-        self.graph_function_combo.addItem("Синус: sin(x)", "sin")
-        self.graph_function_combo.addItem("Косинус: cos(x)", "cos")
-
-        graph_controls.addWidget(self.graph_function_combo, 1)
-
-        graph_controls.addWidget(QLabel("X от:"))
-
-        self.graph_xmin = QDoubleSpinBox()
-        self.graph_xmin.setRange(-100000.0, 100000.0)
-        self.graph_xmin.setDecimals(2)
-        self.graph_xmin.setValue(0.0)
-        self.graph_xmin.setMaximumWidth(82)
-
-        graph_controls.addWidget(self.graph_xmin)
-
-        graph_controls.addWidget(QLabel("до:"))
-
-        self.graph_xmax = QDoubleSpinBox()
-        self.graph_xmax.setRange(-100000.0, 100000.0)
-        self.graph_xmax.setDecimals(2)
-        self.graph_xmax.setValue(10.0)
-        self.graph_xmax.setMaximumWidth(82)
-
-        graph_controls.addWidget(self.graph_xmax)
-
-        self.graph_apply_range = QPushButton("Применить")
-        self.graph_reset_button = QPushButton("Сбросить")
-
-        graph_controls.addWidget(self.graph_apply_range)
-        graph_controls.addWidget(self.graph_reset_button)
-
-        graph_layout.addLayout(graph_controls)
-
-        # Сам график
         self.graph = GraphCanvas()
 
-        # Стандартная панель Matplotlib
-        self.graph_toolbar = NavigationToolbar2QT(
-            self.graph,
-            graph_box
+        rv.addWidget(self.graph, 1)
+
+        # Панель управления графиком
+        graph_controls = QHBoxLayout()
+
+        self.zoom_in_btn = QPushButton("Приблизить")
+        self.zoom_out_btn = QPushButton("Отдалить")
+        self.reset_graph_btn = QPushButton("Сбросить масштаб")
+
+        graph_controls.addWidget(self.zoom_in_btn)
+        graph_controls.addWidget(self.zoom_out_btn)
+        graph_controls.addWidget(self.reset_graph_btn)
+
+        rv.addLayout(graph_controls)
+
+        self.frame_label = QLabel(
+            "Контрольные точки появятся после начала расчёта."
         )
-
-        self.graph.toolbar = self.graph_toolbar
-
-        graph_layout.addWidget(self.graph_toolbar)
-        graph_layout.addWidget(self.graph, 1)
-
-        # Информационная строка
-        self.graph_info = QLabel(
-            "Колесо мыши — масштаб • "
-            "перетаскивание — перемещение • "
-            "щелчок — выбрать точку"
+        self.graph_info_label = QLabel(
+            "Координаты: наведите курсор на точку графика"
         )
-
-        self.graph_info.setWordWrap(True)
-        self.graph_info.setMinimumHeight(30)
-
-        self.graph_info.setStyleSheet(
-            "QLabel { "
-            "color: #465365; "
-            "background: #F3F6FA; "
-            "border: 1px solid #E0E6ED; "
-            "border-radius: 5px; "
-            "padding: 5px; "
-            "}"
+        self.graph_info_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
         )
+        self.graph.coordinate_callback = self.update_graph_info
 
-        self.graph.point_info_callback = self.graph_info.setText
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(0, 0)
+        self.slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.slider.setTickInterval(1)
+        self.slider.setEnabled(False)
 
-        graph_layout.addWidget(self.graph_info)
-
-        right_layout.addWidget(graph_box, 1)
+        rv.addWidget(self.frame_label)
+        rv.addWidget(self.graph_info_label)
+        rv.addWidget(self.slider)
 
         splitter.addWidget(right)
-        splitter.setSizes([260, 620, 500])
 
-        self.setStatusBar(QStatusBar())
-        self.statusBar().showMessage("Готов к подключению")
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
 
-        self.connect_button.clicked.connect(self.connect_to_server)
-        self.disconnect_button.clicked.connect(self.disconnect_from_server)
-        self.rename_button.clicked.connect(self.rename_self)
-        self.send_button.clicked.connect(self.send_chat_message)
-        self.message_edit.returnPressed.connect(self.send_chat_message)
-        self.stats_query_button.clicked.connect(self.run_stats_query)
-        self.stats_query.returnPressed.connect(self.run_stats_query)
-        self.refresh_ports_button.clicked.connect(self.refresh_serial_ports)
-        self.arduino_connect_button.clicked.connect(self.connect_arduino)
-        self.arduino_disconnect_button.clicked.connect(self.disconnect_arduino)
-        self.mode_button.clicked.connect(self.toggle_mode)
-        self.enc_button.clicked.connect(self.toggle_encoding)
-        self.graph_function_combo.currentIndexChanged.connect(
-            lambda _index: self.graph.set_function(
-                self.graph_function_combo.currentData()
-            )
+        splitter.setSizes([420, 1000])
+
+        root.addWidget(splitter, 1)
+
+        self.statusBar().showMessage("Не подключён к серверу")
+
+        # События интерфейса
+        self.connect_btn.clicked.connect(self.connect_server)
+        self.disconnect_btn.clicked.connect(self.disconnect_server)
+
+        self.refresh_btn.clicked.connect(self.request_functions)
+
+        self.function_combo.currentIndexChanged.connect(
+            self.function_changed
         )
 
-        self.graph_reset_button.clicked.connect(
-            self._reset_graph_view
+        self.start_btn.clicked.connect(self.start_or_stop)
+        self.pause_btn.clicked.connect(self.pause_or_resume)
+
+        self.slider.valueChanged.connect(self.select_frame)
+
+        self.zoom_in_btn.clicked.connect(
+            lambda: self.graph.zoom(0.75)
         )
 
-        self.graph_apply_range.clicked.connect(
-            self._apply_graph_range
+        self.zoom_out_btn.clicked.connect(
+            lambda: self.graph.zoom(1.33)
         )
 
-        self.graph_xmin.editingFinished.connect(
-            self._apply_graph_range
+        self.reset_graph_btn.clicked.connect(
+            self.graph.reset_view
         )
 
-        self.graph_xmax.editingFinished.connect(
-            self._apply_graph_range
+    # --------------------------------------------------------
+    # Вспомогательные элементы
+    # --------------------------------------------------------
+
+    def update_graph_info(self, message):
+        self.graph_info_label.setText(message)
+
+    @staticmethod
+    def _double(value, minimum=-1e6):
+
+        widget = QDoubleSpinBox()
+
+        widget.setRange(minimum, 1e6)
+        widget.setDecimals(6)
+        widget.setValue(value)
+
+        return widget
+
+    def add_log(self, message):
+        self.log.append(str(message))
+
+    # --------------------------------------------------------
+    # Отправка JSON
+    # --------------------------------------------------------
+
+    def send(self, obj):
+
+        sock = self.sock
+
+        if sock is None:
+            raise OSError("Нет подключения к серверу")
+
+        data = (
+            json.dumps(
+                obj,
+                ensure_ascii=False,
+                allow_nan=False
+            ) + "\n"
+        ).encode("utf-8")
+
+        with self.send_lock:
+            if self.sock is not sock:
+                raise OSError("Соединение уже закрыто")
+
+            sock.sendall(data)
+
+        self.add_log(
+            "→ JSON: " + json.dumps(obj, ensure_ascii=False)
         )
-        self.refresh_serial_ports()
 
-        self._update_stats_view()
+    # --------------------------------------------------------
+    # Подключение к серверу
+    # --------------------------------------------------------
 
-    def _show_status(self, message):
-        self.incoming.put(("status", message))
+    def connect_server(self):
 
-    def _append_system(self, text):
-        cursor = self.chat_view.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        fmt = QTextCharFormat()
-        fmt.setForeground(QColor(SYSTEM_COLOR))
-        fmt.setFontItalic(True)
-        cursor.insertText(text + "\n", fmt)
-        self.chat_view.setTextCursor(cursor)
-        self.chat_view.ensureCursorVisible()
-
-    def _reset_graph_view(self):
-        self.graph.reset_view()
-
-        self.graph_xmin.setValue(0.0)
-        self.graph_xmax.setValue(10.0)
-
-    def _apply_graph_range(self):
-        xmin = self.graph_xmin.value()
-        xmax = self.graph_xmax.value()
-
-        if xmin >= xmax:
-            QMessageBox.warning(
-                self,
-                "Некорректный диапазон",
-                "Значение «X от» должно быть меньше значения «до»."
-            )
-            return
-
-        self.graph.set_x_range(xmin, xmax)
-    def _color_for(self, name):
-        if name not in self.user_colors:
-            self.user_colors[name] = PALETTE[self.color_index % len(PALETTE)]
-            self.color_index += 1
-        return self.user_colors[name]
-
-    def _append_message(self, sender, body, private=False, outgoing=False, recipient=None):
-        cursor = self.chat_view.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        name_fmt = QTextCharFormat()
-        name_fmt.setForeground(QColor(self._color_for(sender)))
-        name_fmt.setFontWeight(700)
-        body_fmt = QTextCharFormat()
-        body_fmt.setForeground(QColor(self._color_for(sender) if private else GENERAL_TEXT_COLOR))
-        if private:
-            prefix = f"@{sender}: " if not outgoing else f"→ {recipient}: "
-            cursor.insertText(prefix, name_fmt)
-            cursor.insertText(body + "\n", body_fmt)
-        else:
-            cursor.insertText(f"{sender}: ", name_fmt)
-            cursor.insertText(body + "\n", body_fmt)
-        self.chat_view.setTextCursor(cursor)
-        self.chat_view.ensureCursorVisible()
-        self._send_chat_line_to_arduino(sender, body, private, outgoing, recipient)
-
-    def _send_chat_line_to_arduino(self, sender, body, private, outgoing, recipient):
-        if not self.arduino.is_connected:
-            return
-
-        if outgoing and private:
-            raw = f"[PM] -> @ {recipient}: {body}"
-        elif private:
-            raw = f"[PM] @ {sender}: {body}"
-        else:
-            raw = f"{sender}: {body}"
-
-        self.arduino.send_chat_line(raw)
-
-
-    def _update_users(self):
-        ordered = []
-        if self.my_name:
-            ordered.append(self.my_name)
-        ordered.extend(sorted(u for u in self.users if u != self.my_name))
-        self.users_list.clear()
-        for name in ordered:
-            label = f"{name} (вы)" if name == self.my_name else name
-            item = QListWidgetItem(label)
-            item.setForeground(QColor(self._color_for(name)))
-            if name == self.my_name:
-                font = item.font()
-                font.setBold(True)
-                item.setFont(font)
-            self.users_list.addItem(item)
-        self.stats.set_users(ordered)
-        self._update_stats_view()
-
-    def _connect_socket(self, host, port):
-        """
-        Подключение к TCP-серверу.
-        Поддерживает серверы, которые сначала отправляют приглашение,
-        и серверы, которые сразу ожидают имя пользователя.
-        """
-        sock = socket.create_connection((host, port), timeout=20)
-        sock.settimeout(20)
-
-        reader = SocketLineReader(sock)
-
-        prompt = ""
-
-        try:
-            prompt = reader.readline()
-        except socket.timeout:
-            # Сервер не отправил приглашение — возможно, он сразу ждёт имя.
-            pass
-
-        if prompt:
-            self.incoming.put(("system", prompt))
-
-        return sock, reader
-
-    def connect_to_server(self):
-        if self.connected:
+        if self.sock:
             return
 
         host = self.host_edit.text().strip()
-        port = self.port_spin.value()
 
         if not host:
             QMessageBox.warning(
                 self,
                 "Ошибка",
-                "Введите IP-адрес сервера."
+                "Введите адрес сервера."
             )
             return
 
-        name, ok = QInputDialog.getText(
-            self,
-            "Регистрация",
-            "Введите имя (одно слово, до 20 символов):"
-        )
-
-        if not ok:
-            return
-
-        name = clean_text(name or "")
-        error = validate_name(name)
-
-        if error:
-            QMessageBox.warning(self, "Некорректное имя", error)
-            return
-
-        self.connect_button.setEnabled(False)
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-
-        sock = None
+        if host in ("0.0.0.0", "::"):
+            host = "127.0.0.1"
 
         try:
-            sock, reader = self._connect_socket(host, port)
 
-            # Отправляем имя серверу.
-            sock.sendall((name + "\n").encode("utf-8"))
+            sock = socket.create_connection(
+                (host, self.port_spin.value()),
+                timeout=5
+            )
 
-            # Ждём ответ сервера.
-            sock.settimeout(5)
-
-            response = ""
-
-            try:
-                response = reader.readline()
-            except socket.timeout:
-                raise TimeoutError(
-                    "Сервер не ответил на регистрацию за 5 секунд.\n\n"
-                    "Проверьте, что сервер запущен и ожидает подключения "
-                    "на указанном порту."
-                )
-
-            if not response:
-                raise ConnectionError(
-                    "Сервер закрыл соединение во время регистрации."
-                )
-
-            self.incoming.put(("system", response))
-
-            low = response.lower()
-
-            if any(word in low for word in (
-                    "ошибка",
-                    "занят",
-                    "некоррект",
-                    "запрещено"
-            )):
-                raise RuntimeError(
-                    "Сервер отклонил регистрацию:\n" + response
-                )
-
-            # Подключение установлено.
             sock.settimeout(None)
 
             self.sock = sock
-            self.my_name = name
-            self.connected = True
 
             self.reader_stop.clear()
-            self.users = {name}
 
-            self.stats.start_session()
-            self._update_users()
-
-            self.reader_thread = threading.Thread(
-                target=self._reader_loop,
-                args=(reader,),
+            self.reader = threading.Thread(
+                target=self.reader_loop,
+                args=(sock,),
                 daemon=True
             )
-            self.reader_thread.start()
 
-            self.connect_button.setEnabled(False)
-            self.disconnect_button.setEnabled(True)
-            self.rename_button.setEnabled(True)
-            self.message_edit.setEnabled(True)
-            self.send_button.setEnabled(True)
+            self.reader.start()
 
-            self.message_edit.setFocus()
+            self.connect_btn.setEnabled(False)
+            self.disconnect_btn.setEnabled(True)
 
-            self.heartbeat_timer.start(PING_INTERVAL_MS)
-            self.users_timer.start(USERS_REFRESH_MS)
-
-            self.setWindowTitle(
-                f"Оконный клиент чата — {name}"
-            )
+            self.function_combo.setEnabled(True)
 
             self.statusBar().showMessage(
-                f"Подключён к {host}:{port}"
+                f"Подключено к {host}:{self.port_spin.value()}"
             )
 
-            self._append_system(
-                f"Подключение установлено. Вы вошли как {name}."
+            self.add_log(
+                f"Подключено к серверу {host}:{self.port_spin.value()}"
             )
 
-            self._send_raw("#users")
+            self.request_functions()
 
-        except socket.timeout:
-            QMessageBox.critical(
-                self,
-                "Тайм-аут",
-                "Время ожидания подключения истекло.\n\n"
-                "Проверьте IP-адрес, порт и состояние сервера."
-            )
-
-        except ConnectionRefusedError:
-            QMessageBox.critical(
-                self,
-                "Сервер недоступен",
-                f"Подключение отклонено.\n\n"
-                f"Адрес: {host}\n"
-                f"Порт: {port}\n\n"
-                "Возможные причины:\n"
-                "• сервер не запущен;\n"
-                "• указан неправильный порт;\n"
-                "• сервер слушает другой сетевой интерфейс;\n"
-                "• соединение блокируется сетью."
-            )
-
-        except Exception as exc:
+        except OSError as exc:
+            self.statusBar().showMessage("Ошибка соединения")
             QMessageBox.critical(
                 self,
                 "Ошибка подключения",
                 str(exc)
             )
 
-        finally:
-            if not self.connected:
-                if sock:
-                    try:
-                        sock.close()
-                    except OSError:
-                        pass
+    # --------------------------------------------------------
+    # Получение сообщений в отдельном потоке
+    # --------------------------------------------------------
 
-                self.sock = None
-                self.connect_button.setEnabled(True)
+    def reader_loop(self, sock):
 
-            QApplication.restoreOverrideCursor()
+        buffer = bytearray()
 
-    def _reader_loop(self, stream):
         try:
-            while not self.reader_stop.is_set():
-                line = stream.readline()
 
-                if not line:
+            while not self.reader_stop.is_set():
+
+                chunk = sock.recv(8192)
+
+                if not chunk:
                     break
 
-                self.incoming.put(
-                    ("line", line.rstrip("\r\n"))
-                )
+                buffer.extend(chunk)
 
-        except (OSError, UnicodeError, ValueError) as exc:
+                while b"\n" in buffer:
+
+                    line, _, rest = buffer.partition(b"\n")
+                    buffer = bytearray(rest)
+
+                    if not line.strip():
+                        continue
+
+                    try:
+
+                        message = json.loads(
+                            line.decode("utf-8")
+                        )
+
+                        self.incoming.put(message)
+
+                    except (ValueError, UnicodeDecodeError):
+
+                        self.incoming.put({
+                            "type": "error",
+                            "message": "Некорректный JSON от сервера"
+                        })
+
+        except OSError as exc:
+
             if not self.reader_stop.is_set():
-                self.incoming.put(
-                    ("status", f"Ошибка чтения сервера: {exc}")
-                )
+
+                self.incoming.put({
+                    "type": "error",
+                    "message": f"Соединение потеряно: {exc}"
+                })
 
         finally:
-            if not self.reader_stop.is_set():
-                self.incoming.put(
-                    ("disconnected", "Соединение с сервером закрыто.")
-                )
 
-    def _process_incoming(self):
-        changed_stats = False
-        while True:
+            if not self.reader_stop.is_set():
+                self.incoming.put({
+                    "type": "disconnected"
+                })
+
+    # --------------------------------------------------------
+    # Отключение
+    # --------------------------------------------------------
+
+    def disconnect_server(self):
+
+        self.reader_stop.set()
+
+        old_sock = self.sock
+        self.sock = None
+
+        if old_sock:
+
             try:
-                kind, payload = self.incoming.get_nowait()
+                old_sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+            try:
+                old_sock.close()
+            except OSError:
+                pass
+
+        self.connect_btn.setEnabled(True)
+        self.disconnect_btn.setEnabled(False)
+        self.statusBar().showMessage("Не подключён к серверу")
+
+        self.function_combo.setEnabled(False)
+        self.start_btn.setEnabled(False)
+
+        self._finish("Соединение закрыто")
+
+    # --------------------------------------------------------
+    # Запрос списка функций из DLL
+    # --------------------------------------------------------
+
+    def request_functions(self):
+
+        if not self.sock:
+            return
+
+        try:
+
+            self.send({
+                "type": "list_functions",
+                "rescan": True
+            })
+
+        except OSError as exc:
+            self.add_log(str(exc))
+
+    # --------------------------------------------------------
+    # Изменение выбранной функции
+    # --------------------------------------------------------
+
+    def function_changed(self, *_):
+
+        item = self.function_combo.currentData()
+
+        while self.params_layout.count():
+            child = self.params_layout.takeAt(0)
+            widget = child.widget()
+            if widget:
+                widget.deleteLater()
+        self.param_widgets = []
+
+        if not item:
+            self.formula_label.setText("Нет доступных функций.")
+            return
+
+        self.formula_label.setText(
+            item.get("formula", item.get("title", ""))
+        )
+
+        # Создаём поля для параметров текущей функции
+        for param in item.get("params", []):
+
+            box = QWidget()
+            layout = QVBoxLayout(box)
+
+            layout.setContentsMargins(0, 0, 0, 0)
+
+            layout.addWidget(
+                QLabel(param["name"])
+            )
+
+            spin = self._double(
+                float(param.get("default", 0))
+            )
+
+            layout.addWidget(spin)
+
+            self.params_layout.addWidget(box)
+
+            self.param_widgets.append(
+                (param["name"], spin)
+            )
+
+    # --------------------------------------------------------
+    # Обработка входящих сообщений
+    # --------------------------------------------------------
+
+    def process_messages(self):
+
+        while True:
+
+            try:
+                msg = self.incoming.get_nowait()
             except queue.Empty:
                 break
-            if kind == "line":
-                changed_stats |= self._handle_server_line(payload)
-            elif kind == "system":
-                self._append_system(payload)
-            elif kind == "status":
-                self._append_system(payload)
-                self.statusBar().showMessage(payload, 8000)
+
+            kind = msg.get("type")
+
+            # Список функций
+            if kind == "functions":
+
+                self.catalog = msg.get("items", [])
+
+                self.function_combo.blockSignals(True)
+                self.function_combo.clear()
+
+                for item in self.catalog:
+
+                    title = (
+                        f"{item.get('title')} — "
+                        f"{item.get('lib')} "
+                        f"({item.get('author', '—')})"
+                    )
+
+                    self.function_combo.addItem(
+                        title,
+                        item
+                    )
+
+                self.function_combo.blockSignals(False)
+
+                self.function_changed()
+
+                self.start_btn.setEnabled(
+                    bool(self.catalog) and not self.running
+                )
+
+                self.add_log(
+                    f"Каталог DLL обновлён: {len(self.catalog)} функций"
+                )
+
+            # Расчёт начат
+            elif kind == "started":
+
+                self.running = True
+                self.paused = False
+                self.run_id = msg.get("run_id")
+
+                self.start_btn.setEnabled(True)
+                self.start_btn.setText("Остановить расчёт")
+
+                self.pause_btn.setEnabled(True)
+                self.pause_btn.setText("Пауза")
+
+                self._set_inputs(False)
+
+                self.progress_label.setText(
+                    f"Расчёт запущен: "
+                    f"{msg.get('frames')} кадров, "
+                    f"{msg.get('points')} точек на кадр"
+                )
+
+            # Новый кадр
+            elif kind == "frame":
+
+                follow_latest = (
+                    not self.frames
+                    or self.slider.value() >= len(self.frames) - 1
+                )
+                self.frames.append(msg)
+                latest_index = len(self.frames) - 1
+
+                self.slider.blockSignals(True)
+                self.slider.setRange(0, latest_index)
+                self.slider.setTickInterval(max(1, (latest_index + 1) // 20))
+                if follow_latest:
+                    self.slider.setValue(latest_index)
+                self.slider.setEnabled(True)
+                self.slider.blockSignals(False)
+
+                if follow_latest:
+                    self.select_frame(latest_index)
+
+                self.add_log(
+                    f"Получен кадр {len(self.frames)} "
+                    f"| t = {msg.get('t', 0):.5g} "
+                    f"| точек = {len(msg.get('x', []))}"
+                )
+
+            # Пауза
+            elif kind == "paused":
+
+                self.paused = True
+
+                self.pause_btn.setText("Продолжить")
+
+                self.progress_label.setText(
+                    "Расчёт приостановлен"
+                )
+
+            # Продолжение
+            elif kind == "resumed":
+
+                self.paused = False
+
+                self.pause_btn.setText("Пауза")
+
+                self.progress_label.setText(
+                    "Расчёт продолжается"
+                )
+
+            # Завершение
+            elif kind == "done":
+
+                self._finish(
+                    f"Расчёт {msg.get('reason')}. "
+                    f"Получено кадров: {msg.get('frames')}"
+                )
+
+            # Загрузка CPU
+            elif kind == "server_cpu":
+
+                self.cpu_label.setText(
+                    f"Загрузка CPU процесса сервера: "
+                    f"{msg.get('percent', 0):.1f}%"
+                )
+
+            # Ошибка
+            elif kind == "error":
+
+                error = msg.get("message", "Неизвестная ошибка")
+
+                self.add_log("Ошибка сервера: " + error)
+
+                self.statusBar().showMessage(error)
+
+                if not self.running:
+                    self.start_btn.setEnabled(
+                        bool(self.sock and self.catalog)
+                    )
+
+            # Отключение сервера
             elif kind == "disconnected":
-                if self.connected:
-                    self._append_system(payload)
-                    self._set_disconnected_state()
-        if changed_stats:
-            self._update_stats_view()
 
-    def _handle_server_line(self, line):
-        if not line:
-            return False
-        lower = line.lower()
+                self.disconnect_server()
 
-        if "пользователи онлайн" in lower or lower.startswith("пользователи:"):
-            self.users_block = True
-            self.users_buffer = []
-            # Вариант сервера со списком в той же строке.
-            if ":" in line and "," in line:
-                self.users_buffer.extend(x.strip() for x in line.split(":", 1)[1].split(",") if x.strip())
-            return False
-        if self.users_block and (line.strip().startswith("-") or line.startswith("  ")):
-            candidate = line.strip().lstrip("-").strip()
-            if candidate:
-                self.users_buffer.append(candidate)
-                self.users = set(self.users_buffer)
-                self.users.add(self.my_name)
-                self._update_users()
-            return False
-        if self.users_block:
-            if self.users_buffer:
-                self.users = set(self.users_buffer)
-                self.users.add(self.my_name)
-                self._update_users()
-            self.users_block = False
+                self.add_log(
+                    "Соединение закрыто сервером"
+                )
 
-        # Служебные уведомления переименования.
-        rename_match = re.search(r"\*\*\*\s*(\S+)\s+сменил имя на\s+(\S+)\s*\*\*\*", line)
-        if rename_match:
-            old, new = rename_match.groups()
-            self.users.discard(old)
-            self.users.add(new)
-            if old == self.my_name:
-                self.my_name = new
-                self.setWindowTitle(f"Оконный клиент чата — {new}")
-            if old in self.user_colors:
-                self.user_colors[new] = self.user_colors.pop(old)
-            self._append_system(line)
-            self._update_users()
-            return True
+    # --------------------------------------------------------
+    # Блокировка параметров во время расчёта
+    # --------------------------------------------------------
 
-        # Служебные строки о входе/выходе.
-        if line.startswith("***"):
-            self._append_system(line)
-            m = re.search(r"\*\*\*\s*(\S+)\s+(?:присоединился|покинул)", line)
-            if m:
-                if "покинул" in line:
-                    self.users.discard(m.group(1))
-                else:
-                    self.users.add(m.group(1))
-                self._update_users()
-            return True
+    def _set_inputs(self, enabled):
 
-        # Формат Java-сервера: [PM] @ sender: text / [PM] -> @ recipient: text
-        if line.startswith("[PM] @ "):
-            body = line[len("[PM] @ "):]
-            if ":" in body:
-                sender, message = body.split(":", 1)
-                sender, message = sender.strip(), message.strip()
-                self._append_message(sender, message, private=True)
-                self.stats.record_private(sender, incoming=True)
-                return True
-        if line.startswith("[PM] -> @ "):
-            body = line[len("[PM] -> @ "):]
-            if ":" in body:
-                recipient, message = body.split(":", 1)
-                recipient, message = recipient.strip(), message.strip()
-                self._append_message(self.my_name, message.strip(), private=True, outgoing=True, recipient=recipient)
-                self.stats.record_private(self.my_name, incoming=False)
-                return True
+        widgets = (
+            self.function_combo,
+            self.x_from,
+            self.x_to,
+            self.x_step,
+            self.t_from,
+            self.t_to,
+            self.t_step,
+            self.emit_spin,
+            self.complexity_spin
+        )
 
-        # Формат из ТЗ другого типового сервера: @Имя: сообщение.
-        if line.startswith("@") and ":" in line:
-            sender, message = line[1:].split(":", 1)
-            sender, message = sender.strip(), message.strip()
-            self.users.add(sender)
-            self._append_message(sender, message, private=True)
-            self.stats.record_private(sender, incoming=True)
-            self._update_users()
-            return True
+        for widget in widgets:
+            widget.setEnabled(enabled)
 
-        # Общая строка: имя отделяется по первому двоеточию.
-        if ": " in line and not line.startswith(("OK ", "TFT ", "READY", ">>", "~")):
-            sender, message = line.split(":", 1)
-            sender = sender.strip()
-            message = message.strip()
-            if sender and " " not in sender and len(sender) <= 20:
-                if sender == self.my_name and self.pending_general_echoes:
-                    expected = self.pending_general_echoes[0]
-                    if message.startswith(expected):
-                        self.pending_general_echoes.popleft()
-                        # Собственное сообщение уже показано при отправке; Arduino получает его там.
-                        self.stats.record_general(sender, outgoing=True, count_message=False)
-                        return True
-                self.users.add(sender)
-                self._append_message(sender, message, private=False)
-                self.stats.record_general(sender, outgoing=(sender == self.my_name))
-                self._update_users()
-                return True
+        for _, widget in self.param_widgets:
+            widget.setEnabled(enabled)
 
-        # Не выводим автоматические строки справки и ответов как сообщения чата.
-        self._append_system(line)
-        if "уже занято" in lower or lower.startswith("ошибка:"):
-            self.statusBar().showMessage(line, 8000)
-        return False
+    # --------------------------------------------------------
+    # Начало и остановка расчёта
+    # --------------------------------------------------------
 
-    def _send_raw(self, line):
-        if not self.connected or not self.sock:
-            return False
-        try:
-            self.sock.sendall((line + "\n").encode("utf-8"))
-            return True
-        except OSError as exc:
-            self._append_system(f"Не удалось отправить данные: {exc}")
-            self._set_disconnected_state()
-            return False
+    def start_or_stop(self):
 
-    def _send_ping(self):
-        self._send_raw("#ping")
+        # Остановка
+        if self.running:
 
-    def _request_users(self):
-        if self.connected:
-            self._send_raw("#users")
-
-    def send_chat_message(self):
-        if not self.connected:
-            return
-        line = clean_text(self.message_edit.text() or "")
-        if not line:
-            return
-        if len(line) > MAX_MESSAGE_LENGTH:
-            QMessageBox.warning(self, "Слишком длинное сообщение", "Максимальная длина — 999 символов.")
-            return
-        self.message_edit.clear()
-        self.message_edit.setFocus()
-
-        # Локальные команды прежнего клиента не отправляются серверу.
-        if line.lower() == "#mode":
-            self.toggle_mode()
-            return
-        if line.lower() == "#enc":
-            self.toggle_encoding()
-            return
-        if line.lower() == "#exit":
-            self.disconnect_from_server()
-            return
-
-        if line.startswith("#"):
-            self._send_raw(line)
-            return
-
-        if self._send_raw(line):
-            self.pending_general_echoes.append(line)
-            self._append_message(self.my_name, line, private=False)
-            self.stats.record_general(self.my_name, outgoing=True)
-            self._update_stats_view()
-
-    def rename_self(self):
-        if not self.connected:
-            return
-        new_name, ok = QInputDialog.getText(self, "Переименование", "Новое имя:", text=self.my_name)
-        if not ok:
-            return
-        new_name = clean_text(new_name or "")
-        error = validate_name(new_name)
-        if error:
-            QMessageBox.warning(self, "Некорректное имя", error)
-            return
-        if new_name == self.my_name:
-            return
-        self._send_raw("#NewName " + new_name)
-
-    def _user_context_menu(self, point):
-        item = self.users_list.itemAt(point)
-        if not item or not self.connected:
-            return
-        target = item.text().replace(" (вы)", "")
-        if target == self.my_name:
-            return
-        menu = QMenu(self)
-        action = QAction("Личное сообщение…", self)
-        menu.addAction(action)
-        selected = menu.exec(self.users_list.mapToGlobal(point))
-        if selected == action:
-            text, ok = QInputDialog.getText(self, "Личное сообщение", f"Сообщение для {target}:")
-            if ok and clean_text(text or ""):
-                message = clean_text(text)
-                if len(message) > MAX_MESSAGE_LENGTH:
-                    QMessageBox.warning(self, "Слишком длинное сообщение", "Максимальная длина — 999 символов.")
-                    return
-                if self._send_raw(f"#ToUser {target} {message}"):
-                    self.pending_pm_echoes.append((target, message))
-
-    def run_stats_query(self):
-        query = clean_text(self.stats_query.text() or "")
-        if not query:
-            return
-        answer = self.stats.query(query, self.users)
-        self.stats_answer.setText(answer)
-
-    def _update_stats_view(self):
-        self.stats_view.setPlainText(self.stats.summary(len(self.users)))
-
-    def refresh_serial_ports(self):
-        self.port_combo.clear()
-        ports = self.arduino.list_ports()
-        self.port_combo.addItems(ports)
-        if not ports:
-            self.port_combo.addItem("Порты не найдены")
-
-    def connect_arduino(self):
-        port = self.port_combo.currentText()
-        if not port or port == "Порты не найдены":
-            QMessageBox.information(self, "Arduino", "Сначала подключите плату и обновите список портов.")
-            return
-        ok, message = self.arduino.connect(port)
-        self.arduino_status.setText(message)
-        self.arduino_connect_button.setEnabled(not ok)
-        self.arduino_disconnect_button.setEnabled(ok)
-        self.statusBar().showMessage(message, 8000)
-        if ok:
-            self._append_system(message)
-
-    def disconnect_arduino(self):
-        self.arduino.disconnect()
-        self.arduino_status.setText("Не подключена")
-        self.arduino_connect_button.setEnabled(True)
-        self.arduino_disconnect_button.setEnabled(False)
-
-    def toggle_mode(self):
-        self.arduino.only_sender_name = not self.arduino.only_sender_name
-        self.mode_button.setText("Режим дисплея: имя" if self.arduino.only_sender_name else "Режим дисплея: сообщение")
-        self._append_system("[COM-РЕЖИМ] " + ("Только имя отправителя" if self.arduino.only_sender_name else "Полное сообщение"))
-
-    def toggle_encoding(self):
-        self.arduino.send_utf8 = not self.arduino.send_utf8
-        self.enc_button.setText("Кодировка: UTF-8" if self.arduino.send_utf8 else "Кодировка: ASCII")
-        self._append_system("[COM-КОДИРОВКА] " + ("UTF-8 (кириллица)" if self.arduino.send_utf8 else "ASCII (транслит)"))
-
-    def _set_disconnected_state(self):
-        self.connected = False
-        self.reader_stop.set()
-        self.heartbeat_timer.stop()
-        self.users_timer.stop()
-        self.connect_button.setEnabled(True)
-        self.disconnect_button.setEnabled(False)
-        self.rename_button.setEnabled(False)
-        self.message_edit.setEnabled(False)
-        self.send_button.setEnabled(False)
-        self.statusBar().showMessage("Не подключён")
-        self.setWindowTitle("Оконный клиент чата — не подключён")
-        if self.sock:
-            try: self.sock.close()
-            except OSError: pass
-            self.sock = None
-
-    def disconnect_from_server(self):
-        if self.connected:
             try:
-                self._send_raw("#exit")
-            except Exception:
-                pass
-            self._set_disconnected_state()
-            self._append_system("Вы отключились от чата.")
+
+                self.send({
+                    "type": "stop",
+                    "run_id": self.run_id
+                })
+
+                self.start_btn.setEnabled(False)
+
+                self.progress_label.setText(
+                    "Отправлена команда остановки..."
+                )
+
+            except OSError as exc:
+
+                self.add_log(str(exc))
+
+            return
+
+        item = self.function_combo.currentData()
+
+        if not item:
+            return
+
+        if self.x_from.value() >= self.x_to.value():
+
+            QMessageBox.warning(
+                self,
+                "Ошибка параметров",
+                "Начальное значение x должно быть меньше конечного."
+            )
+
+            return
+
+        if self.t_from.value() > self.t_to.value():
+
+            QMessageBox.warning(
+                self,
+                "Ошибка параметров",
+                "Начальное значение t не может быть больше конечного."
+            )
+
+            return
+
+        if self.x_step.value() <= 0 or self.t_step.value() <= 0:
+            QMessageBox.warning(
+                self, "Ошибка параметров",
+                "Шаги по x и t должны быть положительными."
+            )
+            return
+
+        nx = math.floor(
+            (self.x_to.value() - self.x_from.value()) / self.x_step.value() + 1e-10
+        ) + 1
+        nt = math.floor(
+            (self.t_to.value() - self.t_from.value()) / self.t_step.value() + 1e-10
+        ) + 1
+        if nx > 5000:
+            QMessageBox.warning(
+                self, "Слишком много точек",
+                f"Получается {nx} точек на кадр. Максимум — 5000. Увеличьте шаг x."
+            )
+            return
+        if nt > 5000:
+            QMessageBox.warning(
+                self, "Слишком много кадров",
+                f"Получается {nt} кадров. Максимум — 5000. Увеличьте шаг t."
+            )
+            return
+        if nx * nt > 2_000_000:
+            QMessageBox.warning(
+                self, "Слишком большой расчёт",
+                "Общее число вычислений превышает 2 000 000. Увеличьте шаг x или t."
+            )
+            return
+
+        self.frames.clear()
+
+        self.slider.blockSignals(True)
+        self.slider.setRange(0, 0)
+        self.slider.setValue(0)
+        self.slider.setEnabled(False)
+        self.slider.blockSignals(False)
+
+        self.graph.reset_view()
+
+        params = {
+            name: widget.value()
+            for name, widget in self.param_widgets
+        }
+
+        # Идентификатор связывает все сообщения одного расчёта.
+        self.run_id = uuid.uuid4().hex
+
+        # Формат запроса полностью соответствует server.py
+        request = {
+            "type": "start",
+            "run_id": self.run_id,
+
+            "lib": item["lib"],
+            "func": item["id"],
+
+            "callback": "on_frame",
+
+            "x": {
+                "from": self.x_from.value(),
+                "to": self.x_to.value(),
+                "step": self.x_step.value()
+            },
+
+            "t": {
+                "from": self.t_from.value(),
+                "to": self.t_to.value(),
+                "step": self.t_step.value()
+            },
+
+            "params": params,
+
+            "emit_ms": self.emit_spin.value(),
+
+            "complexity": self.complexity_spin.value()
+        }
+
+        try:
+
+            self.send(request)
+
+            self.start_btn.setEnabled(False)
+
+            self.progress_label.setText(
+                "Ожидание запуска расчёта сервером..."
+            )
+
+            self.add_log(
+                "Параметры расчёта отправлены серверу."
+            )
+
+        except OSError as exc:
+
+            self.run_id = None
+            self.add_log(str(exc))
+
+            self.start_btn.setEnabled(
+                bool(self.sock and self.catalog)
+            )
+
+    # --------------------------------------------------------
+    # Пауза и продолжение
+    # --------------------------------------------------------
+
+    def pause_or_resume(self):
+
+        if not self.running:
+            return
+
+        try:
+
+            self.send({
+                "type": "resume" if self.paused else "pause",
+                "run_id": self.run_id
+            })
+
+        except OSError as exc:
+
+            self.add_log(str(exc))
+
+    # --------------------------------------------------------
+    # Переключение контрольных кадров
+    # --------------------------------------------------------
+
+    def select_frame(self, index):
+
+        if not (0 <= index < len(self.frames)):
+            return
+
+        frame = self.frames[index]
+
+        self.graph.show_frame(frame)
+
+        frame_number = int(frame.get("k", index)) + 1
+        total_frames = int(frame.get("total", len(self.frames)))
+        self.frame_label.setText(
+            f"Кадр {frame_number} из {total_frames}"
+            f"    |    t = {frame.get('t', 0):.6g}"
+            f"    |    {frame.get('formula', '')}"
+        )
+
+    # --------------------------------------------------------
+    # Завершение расчёта
+    # --------------------------------------------------------
+
+    def _finish(self, message):
+
+        self.running = False
+        self.paused = False
+        self.run_id = None
+
+        self.start_btn.setText("Начать расчёт")
+
+        self.start_btn.setEnabled(
+            bool(self.sock and self.catalog)
+        )
+
+        self.pause_btn.setText("Пауза")
+        self.pause_btn.setEnabled(False)
+
+        self._set_inputs(bool(self.sock))
+
+        self.progress_label.setText(message)
+
+        self.add_log(message)
+
+    # --------------------------------------------------------
+    # Закрытие окна
+    # --------------------------------------------------------
 
     def closeEvent(self, event):
-        self.disconnect_from_server()
-        self.arduino.disconnect()
+
+        if self.running and self.sock:
+
+            try:
+                self.send({
+                    "type": "stop",
+                    "run_id": self.run_id
+                })
+            except OSError:
+                pass
+
+        self.disconnect_server()
+
         event.accept()
 
 
+# ============================================================
+# ЗАПУСК
+# ============================================================
+
 def main():
+
     app = QApplication(sys.argv)
-    app.setApplicationName("Lab 3 Chat Client")
-    window = ChatClientWindow()
+
+    window = MainWindow()
     window.show()
+
     sys.exit(app.exec())
 
 
