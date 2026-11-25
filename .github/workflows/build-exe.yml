@@ -21,20 +21,22 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
           pip install PySide6 matplotlib pyinstaller
 
       - name: Build EXE
+        shell: pwsh
         run: |
-          python -m PyInstaller ^
-            --noconfirm ^
-            --clean ^
-            --onefile ^
-            --windowed ^
-            --name ClientApp ^
-            --collect-all PySide6 ^
-            --collect-all matplotlib ^
+          python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --windowed `
+            --name ClientApp `
+            --collect-all PySide6 `
+            --collect-all matplotlib `
             client.py
 
       - name: Upload EXE
